@@ -1,19 +1,22 @@
-"""Public synthetic contracts for the one-page PDF editor (RED).
+"""Public synthetic contracts for the one-page PDF editor.
 
 Minimal public interface under test (module ``edit_pdf`` at the worktree root):
 
 - ``contains_rgb_operators(raw: bytes | str) -> bool``
 - ``drawing_signature(page)``, ``image_signature(page)``, ``spans(page)``
 - ``boxes(item)`` (``box`` singular or ``boxes`` plural)
-- ``cmyk(value)`` (K-only policy)
+- ``cmyk(value)`` (any neutral gray maps to K-only CMYK; chromatic raises)
 - ``unchanged_span_key(span: dict) -> hashable``
 - ``source_metadata(document, page)``, ``validate(...)``, ``run(config_path)``
 - CLI ``python edit_pdf.py <config.json>`` requires an explicit config path
   and reports JSON ``{"status": ...}`` on stdout.
+- ``validate(...)`` honors ``validation.require_cmyk_group`` (default False,
+  so generic pages need no transparency group).
 
 All fixtures (source PDFs, tiny images, configs, outputs) live in
-``tempfile.TemporaryDirectory`` and are cleaned automatically. No test reads
-checked-in PDFs, client font files or client configuration paths.
+``tempfile.TemporaryDirectory`` and are cleaned automatically. The only
+font used is the public asset ``examples/synthetic/assets/Barlow-Regular.ttf``.
+No test reads checked-in PDFs, client font files or client configuration paths.
 """
 import hashlib
 import json
@@ -35,14 +38,11 @@ sys.path.insert(0, str(WORKTREE_ROOT))
 import edit_pdf  # noqa: E402
 import pymupdf  # noqa: E402
 
-SYSTEM_TTF = "/usr/share/fonts/liberation-sans-fonts/LiberationSans-Regular.ttf"
-PUBLIC_FONT_NAME = "LiberationSans"
-PUBLIC_FONT_FILE = "LiberationSans.ttf"
-
-
-def require_system_font(testcase):
-    if not Path(SYSTEM_TTF).exists():
-        testcase.skipTest(f"system font missing: {SYSTEM_TTF}")
+PUBLIC_FONT_ASSET = (
+    WORKTREE_ROOT / "examples" / "synthetic" / "assets" / "Barlow-Regular.ttf"
+)
+PUBLIC_FONT_NAME = "Barlow-Regular"
+PUBLIC_FONT_FILE = "Barlow-Regular.ttf"
 
 
 def write_tiny_png(path):
@@ -310,7 +310,7 @@ class TestColorPolicy(unittest.TestCase):
         self.assertEqual(edit_pdf.cmyk("#58595b"), (0, 0, 0, 0.8))
 
     def test_generic_k_only_black_is_accepted(self):
-        """RED: any K-only black must be configurable, not just two hex codes."""
+        """Any neutral gray maps to K-only CMYK, not just two hex codes."""
         self.assertEqual(edit_pdf.cmyk("#000000"), (0, 0, 0, 1))
 
     def test_true_rgb_is_rejected(self):
@@ -330,7 +330,7 @@ class TestExplicitConfigCli(unittest.TestCase):
         self.assertTrue(payload.get("error"))
 
     def test_no_arg_demands_explicit_config(self):
-        """RED: running without a config must demand an explicit path."""
+        """Running without a config must demand an explicit path."""
         completed = run_cli()
         self.assertNotEqual(completed.returncode, 0)
         payload = json.loads(completed.stdout.strip())
@@ -342,27 +342,33 @@ class TestExplicitConfigCli(unittest.TestCase):
 
 
 class TestGenericPageGeometry(unittest.TestCase):
-    def test_matching_letter_geometry_passes_geometry_check(self):
-        """Control: same-size pages reach later checks instead of geometry."""
+    def test_matching_letter_geometry_passes_without_cmyk_group(self):
+        """Generic pages validate fully with no transparency group by default.
+
+        The opt-in gate is checked once here with an explicit
+        ``validation.require_cmyk_group: true`` config.
+        """
         src = pymupdf.open()
         out = pymupdf.open()
         try:
             src.new_page(width=612, height=792)
-            page = out.new_page(width=612, height=792)
-            del page
+            out.new_page(width=612, height=792)
             with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as handle:
                 tmp = Path(handle.name)
             out.save(tmp)
             config = {"required_text": [], "protected_spans": [], "replacements": []}
+            result = edit_pdf.validate(config, src, src[0], tmp, [])
+            self.assertEqual(result["outside_mask_pixel_changes"], 0)
+            gated = dict(config, validation={"require_cmyk_group": True})
             with self.assertRaisesRegex(RuntimeError, r"(?i)(DeviceCMYK|transparency)"):
-                edit_pdf.validate(config, src, src[0], tmp, [])
+                edit_pdf.validate(gated, src, src[0], tmp, [])
         finally:
             src.close()
             out.close()
             tmp.unlink(missing_ok=True)
 
     def test_geometry_error_is_generic_without_fixed_size_name(self):
-        """RED: the size error must not name one hardcoded page size."""
+        """The size error must not name one hardcoded page size."""
         src = pymupdf.open()
         out = pymupdf.open()
         try:
@@ -383,7 +389,6 @@ class TestGenericPageGeometry(unittest.TestCase):
 
 class TestMultilinePerBox(unittest.TestCase):
     def _validate_with_texts(self, box_texts):
-        require_system_font(self)
         config = {
             "required_text": [],
             "protected_spans": [],
@@ -410,7 +415,7 @@ class TestMultilinePerBox(unittest.TestCase):
                     pymupdf.Rect(rect),
                     text,
                     fontname=PUBLIC_FONT_NAME,
-                    fontfile=SYSTEM_TTF,
+                    fontfile=str(PUBLIC_FONT_ASSET),
                     fontsize=10,
                     align=0,
                     overlay=True,
@@ -425,8 +430,14 @@ class TestMultilinePerBox(unittest.TestCase):
         self.addCleanup(src_doc.close)
         return edit_pdf.validate(config, src_doc, src_doc[0], tmp, [])
 
-    def test_correct_distribution_reaches_transparency_gate(self):
-        with self.assertRaisesRegex(RuntimeError, r"(?i)(DeviceCMYK|transparency)"):
+    def test_correct_distribution_passes_validations_without_cmyk_group(self):
+        """Correct per-box distribution passes every check with no CMYK gate.
+
+        Masks are empty in this direct-``validate`` harness, so the flow stops
+        at the render stage: reaching it proves geometry, text, per-box,
+        font, size, color, unedited-span and preserved-object checks passed.
+        """
+        with self.assertRaisesRegex(RuntimeError, r"(?i)outside edit masks"):
             self._validate_with_texts(
                 [([50, 50, 200, 100], "AAA\nBBB"), ([50, 150, 200, 200], "AAA\nBBB")]
             )
@@ -445,7 +456,6 @@ class TestMultilinePerBox(unittest.TestCase):
 
 def _write_preserved_pair(tmpdir, *, same):
     """Two synthetic single-page PDFs with text, one drawing and one image."""
-    require_system_font_for_module()
     src_path = Path(tmpdir) / "source.pdf"
     out_path = Path(tmpdir) / "output.pdf"
     png_path = Path(tmpdir) / "tiny.png"
@@ -472,15 +482,9 @@ def _write_preserved_pair(tmpdir, *, same):
     return src_path, out_path
 
 
-def require_system_font_for_module():
-    if not Path(SYSTEM_TTF).exists():
-        raise unittest.SkipTest(f"system font missing: {SYSTEM_TTF}")
-
-
 class TestPreservedObjectsWithoutCmykGate(unittest.TestCase):
     def test_identical_synthetic_pages_validate_without_cmyk_group(self):
-        """RED: generic pages without a transparency group must still validate."""
-        require_system_font(self)
+        """Generic pages without a transparency group validate."""
         with tempfile.TemporaryDirectory(prefix="public-editor-") as tmpdir:
             src_path, out_path = _write_preserved_pair(tmpdir, same=True)
             src_doc = pymupdf.open(src_path)
@@ -489,8 +493,7 @@ class TestPreservedObjectsWithoutCmykGate(unittest.TestCase):
             edit_pdf.validate(config, src_doc, src_doc[0], out_path, [])
 
     def test_changed_drawings_report_preserved_mismatch(self):
-        """RED: drawing changes must report a preserved-object mismatch."""
-        require_system_font(self)
+        """Drawing changes report a preserved-object mismatch."""
         with tempfile.TemporaryDirectory(prefix="public-editor-") as tmpdir:
             src_path, out_path = _write_preserved_pair(tmpdir, same=False)
             src_doc = pymupdf.open(src_path)
@@ -502,11 +505,10 @@ class TestPreservedObjectsWithoutCmykGate(unittest.TestCase):
 
 def _write_full_run_fixtures(tmpdir):
     """All run() fixtures inside one temporary directory."""
-    require_system_font_for_module()
     tmpdir = Path(tmpdir)
     fonts_dir = tmpdir / "fonts"
     fonts_dir.mkdir()
-    shutil.copy(SYSTEM_TTF, fonts_dir / PUBLIC_FONT_FILE)
+    shutil.copy(PUBLIC_FONT_ASSET, fonts_dir / PUBLIC_FONT_FILE)
     write_tiny_png(tmpdir / "tiny.png")
 
     source_path = tmpdir / "source.pdf"
@@ -567,8 +569,7 @@ def _write_full_run_fixtures(tmpdir):
 
 class TestSyntheticTempRun(unittest.TestCase):
     def test_full_run_inside_temporary_directory(self):
-        """RED: config/source/output/fonts fully in temp dirs must publish."""
-        require_system_font(self)
+        """Config/source/output/fonts fully in temp dirs publish."""
         with tempfile.TemporaryDirectory(prefix="public-editor-") as tmpdir:
             config_path, output_path = _write_full_run_fixtures(tmpdir)
             result = edit_pdf.run(config_path)
@@ -584,8 +585,7 @@ class TestSyntheticTempRun(unittest.TestCase):
 
 class TestRelativeSourceResolution(unittest.TestCase):
     def test_relative_source_resolves_against_config_dir(self):
-        """RED: a relative source must resolve from the config dir, not CWD."""
-        require_system_font(self)
+        """A relative source resolves from the config dir, not CWD."""
         with tempfile.TemporaryDirectory(prefix="public-editor-") as tmpdir:
             config_path, output_path = _write_full_run_fixtures(tmpdir)
             config = json.loads(config_path.read_text(encoding="utf-8"))
@@ -605,8 +605,7 @@ class TestRelativeSourceResolution(unittest.TestCase):
 
 class TestCardinalityByUniqueBbox(unittest.TestCase):
     def test_single_box_for_two_unique_bboxes_rejected(self):
-        """RED: one configured box cannot cover two unique source bboxes."""
-        require_system_font(self)
+        """One configured box cannot cover two unique source bboxes."""
         with tempfile.TemporaryDirectory(prefix="public-editor-") as tmpdir:
             tmpdir = Path(tmpdir)
             source_path = tmpdir / "source.pdf"
@@ -664,7 +663,6 @@ class TestCardinalityByUniqueBbox(unittest.TestCase):
 class TestAtomicPublicationAndCleanup(unittest.TestCase):
     def test_failed_temp_run_publishes_no_output(self):
         """A rejected temp config must not publish any output file."""
-        require_system_font(self)
         with tempfile.TemporaryDirectory(prefix="public-editor-") as tmpdir:
             tmpdir = Path(tmpdir)
             source_path = tmpdir / "source.pdf"
@@ -712,8 +710,7 @@ class TestAtomicPublicationAndCleanup(unittest.TestCase):
 
     def test_failed_temp_run_leaves_no_strays_in_worktree(self):
         """A failed temp run must not pollute the worktree with temp PDFs."""
-        require_system_font(self)
-        before = set(WORKTREE_ROOT.glob(".page-*-*.pdf"))
+        before = set(WORKTREE_ROOT.glob(".pdf-edit-*.pdf"))
         with tempfile.TemporaryDirectory(prefix="public-editor-") as tmpdir:
             config_path, _ = _write_full_run_fixtures(tmpdir)
             config = json.loads(config_path.read_text(encoding="utf-8"))
@@ -721,7 +718,7 @@ class TestAtomicPublicationAndCleanup(unittest.TestCase):
             config_path.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
             with self.assertRaises(RuntimeError):
                 edit_pdf.run(config_path)
-        after = set(WORKTREE_ROOT.glob(".page-*-*.pdf"))
+        after = set(WORKTREE_ROOT.glob(".pdf-edit-*.pdf"))
         self.assertEqual(before, after)
 
 
