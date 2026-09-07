@@ -1,0 +1,13 @@
+.venv/
+.engram/
+work/
+input/
+output/
+configs/
+fonts/
+__pycache__/
+*.py[cod]
+*.pdf
+.pdf-edit-*.pdf
+examples/synthetic/work/
+.DS_Store
