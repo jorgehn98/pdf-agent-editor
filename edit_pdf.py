@@ -102,7 +102,7 @@ def parse_pdffonts(output):
 
 
 def verify_new_fonts(output_document, output_path, expected_stems, require_external=False):
-    """Verify each newly embedded font is CID TrueType/Identity-H/emb/uni."""
+    """Verify expected CID TrueType/Identity-H fonts and external metadata when available."""
     fonts = output_document.get_page_fonts(0)
     by_ref = {}
     for entry in fonts:
@@ -163,7 +163,7 @@ def cmyk(value):
 
     The two documented gray values keep their exact mappings; any other
     neutral gray (``rr == gg == bb``) maps to ``(0, 0, 0, 1 - v/255)``.
-    True chromatic colors raise ``RuntimeError``.
+    Unsupported colors raise ``EditorError``.
     """
     key = value.lower()
     if key in CMYK_K_ONLY:
@@ -409,9 +409,10 @@ def unchanged_span_key(span):
     Includes explicitly ``text``, ``bbox``, ``font``, ``size``, ``color``,
     ``alpha``, ``flags``, ``char_flags``, ``bidi``, ``ascender``,
     ``descender`` and ``origin``.  Missing fields raise ``KeyError`` (no
-    silent defaults).  Lists/tuples are normalized; small numeric noise in
-    ``bbox``/``origin``/``size``/``ascender``/``descender`` is rounded to
-    2 decimals while discrete fields compare exactly.
+    silent defaults).  ``bbox`` and ``origin`` are normalized to tuples;
+    small numeric noise in ``bbox``/``origin``/``size``/``ascender``/
+    ``descender`` is rounded to 2 decimals while discrete fields compare
+    exactly.
     """
     text = span["text"]
     bbox = span["bbox"]

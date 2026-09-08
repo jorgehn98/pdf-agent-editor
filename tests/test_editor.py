@@ -432,11 +432,11 @@ class TestMultilinePerBox(unittest.TestCase):
         return edit_pdf.validate(config, src_doc, src_doc[0], tmp, [])
 
     def test_correct_distribution_passes_validations_without_cmyk_group(self):
-        """Correct per-box distribution passes every check with no CMYK gate.
+        """Correct per-box distribution reaches render validation without a CMYK gate.
 
         Masks are empty in this direct-``validate`` harness, so the flow stops
-        at the render stage: reaching it proves geometry, text, per-box,
-        font, size, color, unedited-span and preserved-object checks passed.
+        at the render stage: reaching it proves geometry, text, per-box, font,
+        size, color, unedited-span and preserved-object checks passed.
         """
         with self.assertRaisesRegex(RuntimeError, r"(?i)outside edit masks"):
             self._validate_with_texts(
