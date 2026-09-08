@@ -15,7 +15,8 @@ Minimal public interface under test (module ``edit_pdf`` at the worktree root):
 
 All fixtures (source PDFs, tiny images, configs, outputs) live in
 ``tempfile.TemporaryDirectory`` and are cleaned automatically. The only
-font used is the public asset ``examples/synthetic/assets/Barlow-Regular.ttf``.
+external font file used is the public asset
+``examples/synthetic/assets/Barlow-Regular.ttf``.
 No test reads checked-in PDFs, client font files or client configuration paths.
 """
 import hashlib
@@ -455,7 +456,7 @@ class TestMultilinePerBox(unittest.TestCase):
 
 
 def _write_preserved_pair(tmpdir, *, same):
-    """Two synthetic single-page PDFs with text, one drawing and one image."""
+    """Two synthetic single-page PDFs with text, an image, and drawings."""
     src_path = Path(tmpdir) / "source.pdf"
     out_path = Path(tmpdir) / "output.pdf"
     png_path = Path(tmpdir) / "tiny.png"
