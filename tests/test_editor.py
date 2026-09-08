@@ -736,7 +736,6 @@ class TestCliDiagnosticPrivacy(unittest.TestCase):
             payload = json.loads(completed.stdout.strip())
             self.assertEqual(payload.get("status"), "partial")
             self.assertTrue(payload.get("error"))
-        # RED today: absolute temp dir leaks into default stdout.
         self.assertNotIn(tmpdir, first.stdout + first.stderr)
         first_payload = json.loads(first.stdout.strip())
         second_payload = json.loads(second.stdout.strip())
@@ -844,7 +843,6 @@ class TestCliDiagnosticPrivacy(unittest.TestCase):
                     self.assertNotEqual(completed.returncode, 0)
                     payload = json.loads(completed.stdout.strip())
                     self.assertEqual(payload.get("status"), "partial")
-                    # RED today: configured text leaks into default stdout.
                     self.assertNotIn(
                         sentinel, completed.stdout + completed.stderr
                     )
@@ -881,7 +879,6 @@ class TestCliDiagnosticPrivacy(unittest.TestCase):
             self.assertNotEqual(completed.returncode, 0)
             payload = json.loads(completed.stdout.strip())
             self.assertEqual(payload.get("status"), "partial")
-            # RED today: fake validator output leaks into default stdout.
             self.assertNotIn(marker, completed.stdout + completed.stderr)
             self.assertNotIn(marker, payload.get("error", ""))
             self.assertNotIn(str(tmpdir_path), completed.stdout + completed.stderr)
@@ -901,7 +898,6 @@ class TestCliDiagnosticPrivacy(unittest.TestCase):
             self.assertEqual(payload.get("status"), "complete")
             output = payload.get("output")
             self.assertIsInstance(output, str)
-            # RED today: absolute temp path leaks into success JSON.
             self.assertFalse(Path(output).is_absolute())
             self.assertNotIn(str(tmpdir), output)
             self.assertTrue((Path(tmpdir) / output).is_file())
