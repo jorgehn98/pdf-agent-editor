@@ -15,7 +15,7 @@ The canonical operating procedure for agents is in [`AGENTS.md`](AGENTS.md).
 
 ## Requirements and setup
 
-- Python 3
+- Python 3.10 or newer
 - PyMuPDF 1.28.2, installed from `requirements.txt`
 - Optional external validators: `pdfimages`, `pdfinfo`, `pdffonts`,
   `pdftotext`, and Ghostscript (`gs`). They are required only when
