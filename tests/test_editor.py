@@ -722,5 +722,190 @@ class TestAtomicPublicationAndCleanup(unittest.TestCase):
         self.assertEqual(before, after)
 
 
+class TestCliDiagnosticPrivacy(unittest.TestCase):
+    """Default CLI diagnostics must not leak workspace paths or content."""
+
+    def test_default_error_has_stable_code_and_hides_absolute_path(self):
+        """Default error carries a stable code and no absolute temp path."""
+        with tempfile.TemporaryDirectory(prefix="public-editor-") as tmpdir:
+            missing = str(Path(tmpdir) / "does-not-exist.json")
+            first = run_cli(missing)
+            second = run_cli(missing)
+        for completed in (first, second):
+            self.assertNotEqual(completed.returncode, 0)
+            payload = json.loads(completed.stdout.strip())
+            self.assertEqual(payload.get("status"), "partial")
+            self.assertTrue(payload.get("error"))
+        # RED today: absolute temp dir leaks into default stdout.
+        self.assertNotIn(tmpdir, first.stdout + first.stderr)
+        first_payload = json.loads(first.stdout.strip())
+        second_payload = json.loads(second.stdout.strip())
+        self.assertNotRegex(
+            first_payload.get("error", ""), r"/[\w.\-]+/[\w.\-]+"
+        )
+        for payload in (first_payload, second_payload):
+            code = payload.get("code")
+            self.assertIsInstance(code, str)
+            self.assertRegex(code, r"^[A-Z][A-Z0-9_]+$")
+        self.assertEqual(first_payload.get("code"), second_payload.get("code"))
+
+    def test_default_error_hides_source_and_replacement_text(self):
+        """Default error must not echo configured source/replacement strings."""
+        source_sentinel = "SRC_SENTINEL_7F3A9C2E"
+        replacement_sentinel = "REPL_SENTINEL_B81D4A6F"
+        with tempfile.TemporaryDirectory(prefix="public-editor-") as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            source_path = tmpdir_path / "source.pdf"
+            doc = pymupdf.open()
+            try:
+                page = doc.new_page(width=400, height=600)
+                page.insert_textbox(
+                    pymupdf.Rect(50, 100, 350, 130),
+                    source_sentinel,
+                    fontname="helv",
+                    fontsize=12,
+                    align=0,
+                    overlay=True,
+                )
+                doc.save(source_path)
+            finally:
+                doc.close()
+            probe = pymupdf.open(source_path)
+            try:
+                printed = probe[0].get_text().splitlines()[0]
+            finally:
+                probe.close()
+            fonts_dir = tmpdir_path / "fonts"
+            fonts_dir.mkdir()
+            base_config = {
+                "source": str(source_path),
+                "source_sha256": sha256_of(source_path),
+                "page_index": 0,
+                "printed_page": printed,
+                "output": str(tmpdir_path / "output.pdf"),
+                "fonts_dir": str(fonts_dir),
+                "required_text": [],
+                "protected_spans": [],
+            }
+
+            def _config_with(replacements, required_text):
+                config = dict(
+                    base_config,
+                    replacements=replacements,
+                    required_text=required_text,
+                )
+                config_path = tmpdir_path / "config.json"
+                config_path.write_text(
+                    json.dumps(config, ensure_ascii=False), encoding="utf-8"
+                )
+                return str(config_path)
+
+            cases = [
+                (
+                    "source-text",
+                    [
+                        {
+                            "source": source_sentinel,
+                            "text": None,
+                            "count": 2,
+                            "box": [50, 100, 350, 130],
+                            "font": PUBLIC_FONT_FILE,
+                            "size": 12,
+                            "align": "left",
+                            "color": "#231f20",
+                        }
+                    ],
+                    [],
+                    source_sentinel,
+                ),
+                (
+                    "replacement-text",
+                    [
+                        {
+                            "source": source_sentinel,
+                            "text": None,
+                            "count": 1,
+                            "box": [50, 100, 350, 130],
+                            "font": PUBLIC_FONT_FILE,
+                            "size": 12,
+                            "align": "left",
+                            "color": "#231f20",
+                        }
+                    ],
+                    [replacement_sentinel],
+                    replacement_sentinel,
+                ),
+            ]
+            for name, replacements, required_text, sentinel in cases:
+                with self.subTest(case=name):
+                    completed = run_cli(
+                        _config_with(replacements, required_text)
+                    )
+                    self.assertNotEqual(completed.returncode, 0)
+                    payload = json.loads(completed.stdout.strip())
+                    self.assertEqual(payload.get("status"), "partial")
+                    # RED today: configured text leaks into default stdout.
+                    self.assertNotIn(
+                        sentinel, completed.stdout + completed.stderr
+                    )
+                    self.assertNotIn(
+                        sentinel, payload.get("error", "")
+                    )
+                    code = payload.get("code")
+                    self.assertIsInstance(code, str)
+                    self.assertRegex(code, r"^[A-Z][A-Z0-9_]+$")
+
+    def test_default_error_hides_validator_output(self):
+        """Default error must not embed raw external validator stdout/stderr."""
+        marker = "PDFTOTEXT_SENTINEL_9Z8X7Y"
+        with tempfile.TemporaryDirectory(prefix="public-editor-") as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            config_path, _ = _write_full_run_fixtures(str(tmpdir_path))
+            fake_bin = tmpdir_path / "fakebin"
+            fake_bin.mkdir()
+            fake_pdftotext = fake_bin / "pdftotext"
+            fake_pdftotext.write_text(
+                f'#!/bin/sh\necho "{marker} stdout leak"\n'
+                f'echo "{marker} stderr leak" >&2\nexit 1\n',
+                encoding="utf-8",
+            )
+            os.chmod(fake_pdftotext, 0o755)
+            previous_path = os.environ.get("PATH", "")
+            try:
+                os.environ["PATH"] = (
+                    str(fake_bin) + os.pathsep + previous_path
+                )
+                completed = run_cli(str(config_path))
+            finally:
+                os.environ["PATH"] = previous_path
+            self.assertNotEqual(completed.returncode, 0)
+            payload = json.loads(completed.stdout.strip())
+            self.assertEqual(payload.get("status"), "partial")
+            # RED today: fake validator output leaks into default stdout.
+            self.assertNotIn(marker, completed.stdout + completed.stderr)
+            self.assertNotIn(marker, payload.get("error", ""))
+            self.assertNotIn(str(tmpdir_path), completed.stdout + completed.stderr)
+            code = payload.get("code")
+            self.assertIsInstance(code, str)
+            self.assertRegex(code, r"^[A-Z][A-Z0-9_]+$")
+
+    def test_success_reports_output_relative_to_workspace(self):
+        """Success JSON must report output relative to the config workspace."""
+        with tempfile.TemporaryDirectory(prefix="public-editor-") as tmpdir:
+            config_path, _ = _write_full_run_fixtures(tmpdir)
+            completed = run_cli(str(config_path))
+            self.assertEqual(
+                completed.returncode, 0, msg=completed.stderr + completed.stdout
+            )
+            payload = json.loads(completed.stdout.strip())
+            self.assertEqual(payload.get("status"), "complete")
+            output = payload.get("output")
+            self.assertIsInstance(output, str)
+            # RED today: absolute temp path leaks into success JSON.
+            self.assertFalse(Path(output).is_absolute())
+            self.assertNotIn(str(tmpdir), output)
+            self.assertTrue((Path(tmpdir) / output).is_file())
+
+
 if __name__ == "__main__":
     unittest.main()

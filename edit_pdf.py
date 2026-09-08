@@ -516,6 +516,52 @@ def validate(config, source_document, source_page, output_path, masks):
         output_document.close()
 
 
+def _cli_error_info(error):
+    """Map a detailed exception to a stable, privacy-safe CLI code/message.
+
+    Direct ``run()``/``validate()`` callers keep the detailed exception;
+    only the CLI boundary uses this mapping so default stdout/stderr never
+    carry absolute paths, source/replacement text or raw validator output.
+    """
+    message = str(error)
+    low = message.lower()
+    if "missing explicit config" in low:
+        return ("MISSING_CONFIG_ARG", "Missing explicit config path argument.")
+    if "config file not found" in low:
+        return ("CONFIG_NOT_FOUND", "Config file not found.")
+    if "invalid json" in low or "config error" in low or "unsupported color" in low \
+            or "is missing 'font'" in low:
+        return ("CONFIG_INVALID", "Invalid configuration.")
+    if "source file not found" in low:
+        return ("SOURCE_NOT_FOUND", "Source file not found.")
+    if "sha-256" in low or "sha256" in low:
+        return ("SOURCE_HASH_MISMATCH", "Source hash mismatch.")
+    if "output path outside" in low or "output must" in low \
+            or "output path is a directory" in low:
+        return ("OUTPUT_INVALID", "Invalid output path.")
+    if "font outside" in low or "font file not found" in low:
+        return ("FONT_UNAVAILABLE", "Font file not available.")
+    if "pdffonts" in low or "pdfimages" in low or "pdfinfo" in low \
+            or "pdftotext" in low or "unexpected diagnostics" in low \
+            or "is not available (required by" in low:
+        return ("VALIDATOR_FAILED", "External validator failed.")
+    if " gs " in f" {message} " or message.startswith("gs "):
+        return ("VALIDATOR_FAILED", "External validator failed.")
+    return ("VALIDATION_FAILED", "Validation failed.") if (
+        "required text missing" in low or "spans remain" in low
+        or "protected spans" in low or "cardinality" in low
+        or "multiline" in low or "per-box" in low or "counter mismatch" in low
+        or "edited span" in low or "edited text does not fit" in low
+        or "unedited spans" in low or "preserved object" in low
+        or "devicecmyk" in low or "transparency group" in low
+        or "rgb" in low or "geometry" in low or "rendered page" in low
+        or "outside edit masks" in low or "visual diff" in low
+        or "spans for" in low or "box " in low or "printed page" in low
+        or "not the expected printed page" in low or "does not fit" in low
+        or "new font" in low or "is not embedded" in low
+    ) else ("INTERNAL_ERROR", "Processing failed.")
+
+
 def within_root(path, root):
     try:
         path.relative_to(root)
@@ -738,7 +784,11 @@ def run(config_path):
         validation = validate(config, source, source_page, temporary, masks)
         os.replace(temporary, output_path)
         temporary = None
-        return {"status": "complete", "output": str(output_path), "duration_seconds": round(time.monotonic() - started, 3), "validation": validation}
+        try:
+            relative_output = output_path.relative_to(workspace).as_posix()
+        except ValueError:
+            relative_output = output_path.name
+        return {"status": "complete", "code": "COMPLETE", "output": relative_output, "duration_seconds": round(time.monotonic() - started, 3), "validation": validation}
     finally:
         if document is not None:
             try:
@@ -751,10 +801,16 @@ def run(config_path):
 
 
 if __name__ == "__main__":
+    _debug = "--debug" in sys.argv[1:]
+    _args = [arg for arg in sys.argv[1:] if arg != "--debug"]
     try:
-        if len(sys.argv) != 2 or not sys.argv[1]:
-            raise RuntimeError("Missing explicit config path argument (usage: edit_pdf.py <config.json>)")
-        print(json.dumps(run(sys.argv[1]), ensure_ascii=False, sort_keys=True))
+        if len(_args) != 1 or not _args[0]:
+            raise RuntimeError("Missing explicit config path argument (usage: edit_pdf.py <config.json> [--debug])")
+        print(json.dumps(run(_args[0]), ensure_ascii=False, sort_keys=True))
     except Exception as error:
-        print(json.dumps({"status": "partial", "error": str(error)}, ensure_ascii=False, sort_keys=True))
+        _code, _safe = _cli_error_info(error)
+        _payload = {"status": "partial", "code": _code, "error": _safe}
+        if _debug:
+            _payload["detail"] = str(error)
+        print(json.dumps(_payload, ensure_ascii=False, sort_keys=True))
         sys.exit(1)
