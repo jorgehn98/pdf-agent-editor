@@ -23,7 +23,9 @@ The command prints the editor's JSON result. A successful run reports
 
 The generator replaces `SOURCE LINE TO REPLACE`, preserves
 `DOC-2026-001 KEEP`, and keeps the source, config, font, and output inside
-the example workspace. Delete `work/` to reset the example and run it again.
+the example workspace. Its generated config sets `overwrite: true`, so the
+command is safe to rerun and replaces the prior generated output. Delete
+`work/` to reset the example and run it again.
 
 ## What to inspect
 

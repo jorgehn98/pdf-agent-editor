@@ -11,8 +11,9 @@ program.
 2. Prepare a compact JSON config. Copy identifiers, text, coordinates, font
    references, and source hash from the inspected workspace; do not guess.
 3. Keep `source`, `output`, and `fonts_dir` inside the config workspace. The
-   editor rejects an output outside that workspace and rejects overwriting the
-   source or config.
+   editor rejects paths outside that workspace and rejects overwriting the
+   source or config. Existing output is protected unless the config explicitly
+   sets `overwrite: true`.
 4. Run the editor with an explicit config path:
 
    ```sh
@@ -29,14 +30,16 @@ The required top-level fields are `source`, `source_sha256`, `page_index`,
 `protected_spans`. `printed_page` may pin the expected first line of the
 selected page.
 
-Each replacement has an exact source string and positive `count`. A text
-replacement also needs `text`, one `box` or a non-empty `boxes` list, a font
+Each replacement has an exact source string and positive `count`. Replacement
+source strings must be unique. A text replacement also needs `text`, one `box`
+or a non-empty `boxes` list, a font
 (`font` plus `fonts_dir`, or `fontfile`), positive `size`, optional `align`
 (`left`, `center`, or `right`), and a color. A color may be a one-, three-, or
 four-component list (Gray, RGB, or CMYK), with every component in `[0, 1]`,
 or a neutral gray hex value, which is converted to K-only CMYK. Multiline text
-is checked per configured box. Use `text: null` when a span should be removed
-without inserting replacement text.
+is checked per configured box. `box` and `boxes` are mutually exclusive; every
+box must be finite and non-degenerate, and destination boxes must not overlap.
+Use `text: null` for the only supported deletion; `text: ""` is invalid.
 
 Validation is generic by default. Set `validation.require_cmyk_group` only
 when the source is known to require a referenced DeviceCMYK transparency
@@ -45,6 +48,13 @@ that must prohibit RGB operators in the output. Set
 `validation.require_external_validators` to require installed `pdfimages`,
 `pdfinfo`, `pdffonts`, `pdftotext`, and `gs`; otherwise missing optional tools are
 skipped, while failures from present tools still fail validation.
+The accepted validation keys are only `require_cmyk_group`, `reject_rgb`,
+`require_external_validators`, and `external_timeout`; unknown keys are
+rejected. `validation.external_timeout` defaults to 60 seconds.
+
+CLI failures return typed, privacy-safe codes and messages. Use `--debug` only
+as an explicit local opt-in when diagnostic detail is needed; do not publish
+that detail.
 
 ## Review boundary
 
