@@ -83,6 +83,7 @@ def build_config():
         "page_index": 0,
         "printed_page": printed,
         "output": "output.pdf",
+        "overwrite": True,
         "fonts_dir": "fonts",
         "replacements": [
             {

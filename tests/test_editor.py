@@ -904,5 +904,562 @@ class TestCliDiagnosticPrivacy(unittest.TestCase):
             self.assertTrue((Path(tmpdir) / output).is_file())
 
 
+class TestStrictSchema(unittest.TestCase):
+    """Ambiguous/invalid configs must be rejected (pure schema seam)."""
+
+    def _base_config(self, tmpdir, **overrides):
+        base = {
+            "source": "source.pdf",
+            "source_sha256": "0" * 64,
+            "page_index": 0,
+            "output": "output.pdf",
+            "fonts_dir": "fonts",
+            "replacements": [],
+            "required_text": [],
+            "protected_spans": [],
+        }
+        base.update(overrides)
+        return base
+
+    def test_rejects_invalid_schema(self):
+        valid_box = [0, 0, 10, 10]
+        base_item = {
+            "source": "A",
+            "count": 1,
+            "text": "X",
+            "box": valid_box,
+            "font": PUBLIC_FONT_FILE,
+            "size": 10,
+            "align": "left",
+            "color": "#231f20",
+        }
+        with self.subTest(case="empty-text-rejected"):
+            bad = dict(base_item, text="")
+            with self.assertRaises(Exception):
+                edit_pdf._validate_replacement(bad, 0)
+        with self.subTest(case="null-deletion-allowed"):
+            edit_pdf._validate_replacement({"source": "A", "count": 1, "text": None}, 0)
+        with self.subTest(case="box-and-boxes-rejected"):
+            bad = dict(base_item, boxes=[valid_box])
+            with self.assertRaises(Exception):
+                edit_pdf._validate_replacement(bad, 0)
+        with self.subTest(case="unknown-validation-key-rejected"):
+            config = self._base_config(
+                None, validation={"unknown_policy_key": True}
+            )
+            with self.assertRaises(Exception):
+                edit_pdf._validate_config(config)
+        for name, box in [
+            ("non-finite-nan", [float("nan"), 0, 10, 10]),
+            ("non-finite-inf", [float("inf"), 0, 10, 10]),
+            ("degenerate-zero-width", [5, 5, 5, 10]),
+            ("degenerate-inverted", [10, 10, 5, 5]),
+        ]:
+            with self.subTest(case=name):
+                with self.assertRaises(Exception):
+                    edit_pdf._check_box(box, "box")
+        with self.subTest(case="duplicate-source-rejected"):
+            config = self._base_config(
+                None,
+                replacements=[
+                    {"source": "DUP", "count": 1, "text": None},
+                    {"source": "DUP", "count": 1, "text": None},
+                ],
+            )
+            with self.assertRaises(Exception):
+                edit_pdf._validate_config(config)
+        with self.subTest(case="overlapping-destination-rejected"):
+            config = self._base_config(
+                None,
+                replacements=[
+                    {"source": "AAA", "count": 1, "text": None, "box": [0, 0, 10, 10]},
+                    {"source": "BBB", "count": 1, "text": None, "box": [5, 5, 15, 15]},
+                ],
+            )
+            with self.assertRaises(Exception):
+                edit_pdf._validate_config(config)
+
+
+class TestFailClosedInspection(unittest.TestCase):
+    """Content/group inspection errors must raise, not return empty/None."""
+
+    def test_inspection_errors_raise(self):
+        class _BoomDoc:
+            def xref_stream(self, _xref):
+                raise RuntimeError("boom stream")
+
+            def xref_length(self):
+                raise RuntimeError("boom length")
+
+            def xref_object(self, _xref):
+                raise RuntimeError("boom object")
+
+        class _BoomPage:
+            xref = 1
+
+            def get_contents(self):
+                return [1]
+
+        with self.subTest(case="content-streams"):
+            with self.assertRaises(Exception):
+                edit_pdf.page_content_streams(_BoomDoc(), _BoomPage())
+        with self.subTest(case="group-signature"):
+            with self.assertRaises(Exception):
+                edit_pdf.group_signature(_BoomDoc(), _BoomPage())
+
+
+class TestQuadSignature(unittest.TestCase):
+    """Quad drawings must have stable signatures without crashing."""
+
+    def test_quad_items_distinguished(self):
+        quad_a = pymupdf.Quad(
+            pymupdf.Point(0, 0),
+            pymupdf.Point(10, 0),
+            pymupdf.Point(0, 10),
+            pymupdf.Point(10, 10),
+        )
+        quad_b = pymupdf.Quad(
+            pymupdf.Point(0, 0),
+            pymupdf.Point(20, 0),
+            pymupdf.Point(0, 20),
+            pymupdf.Point(20, 20),
+        )
+
+        def _page_for(quad):
+            template = {
+                "rect": pymupdf.Rect(0, 0, 20, 20),
+                "type": "fs",
+                "color": (1, 0, 0),
+                "fill": (0, 1, 0),
+                "width": 1.0,
+                "dashes": "[] 0",
+                "closePath": False,
+                "even_odd": False,
+                "items": [("qu", quad)],
+                "seqno": 0,
+                "layer": "",
+                "lineCap": (0, 0, 0),
+                "lineJoin": 0.0,
+                "fill_opacity": 1.0,
+                "stroke_opacity": 1.0,
+            }
+            return _FakePage([template])
+
+        first = edit_pdf.drawing_signature(_page_for(quad_a))
+        second = edit_pdf.drawing_signature(_page_for(quad_a))
+        other = edit_pdf.drawing_signature(_page_for(quad_b))
+        self.assertEqual(first, second)
+        self.assertNotEqual(first, other)
+
+
+class TestPreexistingEqualText(unittest.TestCase):
+    """Pre-existing spans equal to inserted text outside boxes must validate."""
+
+    def test_preexisting_equal_text_outside_boxes_preserved(self):
+        with tempfile.TemporaryDirectory(prefix="public-editor-") as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            source_path = tmpdir_path / "source.pdf"
+            doc = pymupdf.open()
+            try:
+                page = doc.new_page(width=400, height=600)
+                page.insert_textbox(
+                    pymupdf.Rect(50, 200, 350, 240),
+                    "SOURCE_HELLO",
+                    fontname="helv",
+                    fontsize=14,
+                    align=0,
+                    overlay=True,
+                )
+                page.insert_textbox(
+                    pymupdf.Rect(50, 300, 350, 330),
+                    "BONJOUR",
+                    fontname="helv",
+                    fontsize=14,
+                    align=0,
+                    overlay=True,
+                )
+                doc.save(source_path)
+            finally:
+                doc.close()
+            probe = pymupdf.open(source_path)
+            try:
+                printed = probe[0].get_text().splitlines()[0]
+            finally:
+                probe.close()
+            fonts_dir = tmpdir_path / "fonts"
+            fonts_dir.mkdir()
+            shutil.copy(PUBLIC_FONT_ASSET, fonts_dir / PUBLIC_FONT_FILE)
+            config = {
+                "source": str(source_path),
+                "source_sha256": sha256_of(source_path),
+                "page_index": 0,
+                "printed_page": printed,
+                "output": str(tmpdir_path / "output.pdf"),
+                "fonts_dir": str(fonts_dir),
+                "replacements": [
+                    {
+                        "source": "SOURCE_HELLO",
+                        "text": "BONJOUR",
+                        "count": 1,
+                        "box": [50, 200, 350, 240],
+                        "font": PUBLIC_FONT_FILE,
+                        "size": 14,
+                        "align": "left",
+                        "color": "#231f20",
+                    }
+                ],
+                "required_text": ["BONJOUR"],
+                "protected_spans": [],
+            }
+            config_path = tmpdir_path / "config.json"
+            config_path.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
+            result = edit_pdf.run(config_path)
+            self.assertEqual(result.get("status"), "complete")
+
+
+class TestOutputConfinement(unittest.TestCase):
+    """Workspace confinement must cover output outside/source/config and source."""
+
+    def _minimal_config(self, tmpdir_path, source_path, printed, output):
+        fonts_dir = tmpdir_path / "fonts"
+        fonts_dir.mkdir(exist_ok=True)
+        return {
+            "source": str(source_path),
+            "source_sha256": sha256_of(source_path),
+            "page_index": 0,
+            "printed_page": printed,
+            "output": str(output),
+            "fonts_dir": str(fonts_dir),
+            "replacements": [],
+            "required_text": [],
+            "protected_spans": [],
+        }
+
+    def _write_source(self, source_path):
+        doc = pymupdf.open()
+        try:
+            page = doc.new_page(width=400, height=600)
+            page.insert_textbox(
+                pymupdf.Rect(50, 100, 350, 130),
+                "HELLO",
+                fontname="helv",
+                fontsize=12,
+                align=0,
+                overlay=True,
+            )
+            doc.save(source_path)
+        finally:
+            doc.close()
+        probe = pymupdf.open(source_path)
+        try:
+            printed = probe[0].get_text().splitlines()[0]
+        finally:
+            probe.close()
+        return printed
+
+    def test_workspace_confinement(self):
+        with tempfile.TemporaryDirectory(prefix="public-editor-") as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            source_path = tmpdir_path / "source.pdf"
+            printed = self._write_source(source_path)
+            with self.subTest(case="output-outside-rejected"):
+                config = self._minimal_config(
+                    tmpdir_path, source_path, printed, "/tmp/outside-probe.pdf"
+                )
+                config_path = tmpdir_path / "config.json"
+                config_path.write_text(json.dumps(config), encoding="utf-8")
+                with self.assertRaises(Exception):
+                    edit_pdf.run(config_path)
+            with self.subTest(case="output-overwrites-source-rejected"):
+                config = self._minimal_config(
+                    tmpdir_path, source_path, printed, str(source_path)
+                )
+                config_path = tmpdir_path / "config.json"
+                config_path.write_text(json.dumps(config), encoding="utf-8")
+                with self.assertRaises(Exception):
+                    edit_pdf.run(config_path)
+            with self.subTest(case="output-overwrites-config-rejected"):
+                config_path = tmpdir_path / "config.json"
+                config = self._minimal_config(
+                    tmpdir_path, source_path, printed, str(config_path)
+                )
+                config_path.write_text(json.dumps(config), encoding="utf-8")
+                with self.assertRaises(Exception):
+                    edit_pdf.run(config_path)
+        with tempfile.TemporaryDirectory(prefix="public-editor-") as tmpdir:
+            with tempfile.TemporaryDirectory(prefix="public-editor-outer-") as outer:
+                tmpdir_path = Path(tmpdir)
+                outer_path = Path(outer)
+                source_path = outer_path / "source.pdf"
+                printed = self._write_source(source_path)
+                with self.subTest(case="source-outside-rejected"):
+                    config = self._minimal_config(
+                        tmpdir_path, source_path, printed, str(tmpdir_path / "out.pdf")
+                    )
+                    config_path = tmpdir_path / "config.json"
+                    config_path.write_text(json.dumps(config), encoding="utf-8")
+                    with self.assertRaises(Exception):
+                        edit_pdf.run(config_path)
+
+
+class TestExistingOutputSafety(unittest.TestCase):
+    """Existing outputs need opt-in overwrite and survive post-save failure."""
+
+    def test_existing_output_requires_optin_and_survives_failure(self):
+        with tempfile.TemporaryDirectory(prefix="public-editor-") as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            config_path, _ = _write_full_run_fixtures(str(tmpdir_path))
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            output_path = Path(config["output"])
+            sentinel = b"OLD-KNOWN-GOOD-SENTINEL"
+            output_path.write_bytes(sentinel)
+            before = output_path.read_bytes()
+            with self.subTest(case="overwrite-requires-optin"):
+                with self.assertRaises(Exception):
+                    edit_pdf.run(config_path)
+                self.assertEqual(output_path.read_bytes(), before)
+        with tempfile.TemporaryDirectory(prefix="public-editor-") as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            config_path, _ = _write_full_run_fixtures(str(tmpdir_path))
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            output_path = Path(config["output"])
+            sentinel = b"OLD-KNOWN-GOOD-SENTINEL"
+            output_path.write_bytes(sentinel)
+            before = output_path.read_bytes()
+            config["required_text"] = ["MISSING_SENTINEL_XYZ"]
+            config_path.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
+            with self.subTest(case="preserved-on-postsave-failure"):
+                with self.assertRaises(Exception):
+                    edit_pdf.run(config_path)
+                self.assertEqual(output_path.read_bytes(), before)
+
+
+class TestValidatorTimeout(unittest.TestCase):
+    """External validators must support bounded execution."""
+
+    def test_external_validators_are_bounded(self):
+        import inspect
+
+        has_timeout = (
+            "timeout" in inspect.signature(edit_pdf.command_output).parameters
+            or "timeout" in inspect.signature(edit_pdf.run_external).parameters
+        )
+        self.assertTrue(has_timeout, msg="external validators must support timeout")
+        with self.assertRaises(Exception):
+            edit_pdf.run_external(
+                [sys.executable, "-c", "import time; time.sleep(5)"],
+                False,
+                timeout=1,
+            )
+
+
+class TestStableTypedCode(unittest.TestCase):
+    """CLI/API codes must be stable typed values independent of configured text."""
+
+    def _count_mismatch_config(self, tmpdir_path, sentinel):
+        source_path = tmpdir_path / "source.pdf"
+        doc = pymupdf.open()
+        try:
+            page = doc.new_page(width=400, height=600)
+            page.insert_textbox(
+                pymupdf.Rect(50, 100, 350, 130),
+                "HELLO",
+                fontname="helv",
+                fontsize=12,
+                align=0,
+                overlay=True,
+            )
+            doc.save(source_path)
+        finally:
+            doc.close()
+        probe = pymupdf.open(source_path)
+        try:
+            printed = probe[0].get_text().splitlines()[0]
+        finally:
+            probe.close()
+        fonts_dir = tmpdir_path / "fonts"
+        fonts_dir.mkdir(exist_ok=True)
+        config = {
+            "source": str(source_path),
+            "source_sha256": sha256_of(source_path),
+            "page_index": 0,
+            "printed_page": printed,
+            "output": str(tmpdir_path / f"output-{sentinel}.pdf"),
+            "fonts_dir": str(fonts_dir),
+            "replacements": [{"source": sentinel, "count": 1, "text": None}],
+            "required_text": [],
+            "protected_spans": [],
+        }
+        config_path = tmpdir_path / f"config-{sentinel}.json"
+        config_path.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
+        return config_path
+
+    def test_cli_code_independent_of_configured_text(self):
+        with tempfile.TemporaryDirectory(prefix="public-editor-") as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            codes = {}
+            for sentinel in ["ALPHA_SENTINEL", "pdftotext"]:
+                config_path = self._count_mismatch_config(tmpdir_path, sentinel)
+                completed = run_cli(str(config_path))
+                self.assertNotEqual(completed.returncode, 0)
+                payload = json.loads(completed.stdout.strip())
+                codes[sentinel] = payload.get("code")
+            self.assertEqual(codes["ALPHA_SENTINEL"], codes["pdftotext"])
+
+    def test_run_raises_typed_error_with_stable_code(self):
+        self.assertTrue(hasattr(edit_pdf, "EditorError"))
+        with tempfile.TemporaryDirectory(prefix="public-editor-") as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            seen = {}
+            for sentinel in ["ALPHA_SENTINEL", "BETA_SENTINEL"]:
+                config_path = self._count_mismatch_config(tmpdir_path, sentinel)
+                with self.assertRaises(edit_pdf.EditorError) as ctx:
+                    edit_pdf.run(config_path)
+                code = ctx.exception.code
+                self.assertRegex(code, r"^[A-Z][A-Z0-9_]+$")
+                seen[sentinel] = code
+            self.assertEqual(seen["ALPHA_SENTINEL"], seen["BETA_SENTINEL"])
+
+
+class TestValidMultiboxFontfile(unittest.TestCase):
+    """Valid null/fontfile/multibox runs must keep succeeding (controls)."""
+
+    def test_valid_multibox_fontfile_and_null_runs_succeed(self):
+        with tempfile.TemporaryDirectory(prefix="public-editor-") as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            source_path = tmpdir_path / "source.pdf"
+            doc = pymupdf.open()
+            try:
+                page = doc.new_page(width=400, height=600)
+                page.insert_textbox(
+                    pymupdf.Rect(50, 100, 350, 130),
+                    "DUP",
+                    fontname="helv",
+                    fontsize=12,
+                    align=0,
+                    overlay=True,
+                )
+                page.insert_textbox(
+                    pymupdf.Rect(50, 300, 350, 330),
+                    "DUP",
+                    fontname="helv",
+                    fontsize=12,
+                    align=0,
+                    overlay=True,
+                )
+                doc.save(source_path)
+            finally:
+                doc.close()
+            probe = pymupdf.open(source_path)
+            try:
+                matches = [s for s in edit_pdf.spans(probe[0]) if s["text"] == "DUP"]
+                boxes = [[float(value) for value in span["bbox"]] for span in matches]
+                printed = probe[0].get_text().splitlines()[0]
+            finally:
+                probe.close()
+            fonts_dir = tmpdir_path / "fonts"
+            fonts_dir.mkdir()
+            shutil.copy(PUBLIC_FONT_ASSET, fonts_dir / PUBLIC_FONT_FILE)
+            shutil.copy(PUBLIC_FONT_ASSET, tmpdir_path / PUBLIC_FONT_FILE)
+            with self.subTest(case="multibox-text"):
+                config = {
+                    "source": str(source_path),
+                    "source_sha256": sha256_of(source_path),
+                    "page_index": 0,
+                    "printed_page": printed,
+                    "output": str(tmpdir_path / "out-multi.pdf"),
+                    "fonts_dir": str(fonts_dir),
+                    "replacements": [
+                        {
+                            "source": "DUP",
+                            "text": "HI",
+                            "count": 2,
+                            "boxes": boxes,
+                            "font": PUBLIC_FONT_FILE,
+                            "size": 12,
+                            "align": "left",
+                            "color": "#231f20",
+                        }
+                    ],
+                    "required_text": [],
+                    "protected_spans": [],
+                }
+                config_path = tmpdir_path / "config-multi.json"
+                config_path.write_text(
+                    json.dumps(config, ensure_ascii=False), encoding="utf-8"
+                )
+                result = edit_pdf.run(config_path)
+                self.assertEqual(result.get("status"), "complete")
+            with self.subTest(case="fontfile"):
+                single_path = tmpdir_path / "single.pdf"
+                doc = pymupdf.open()
+                try:
+                    page = doc.new_page(width=400, height=600)
+                    page.insert_textbox(
+                        pymupdf.Rect(50, 200, 350, 240),
+                        "SOURCE_HELLO",
+                        fontname="helv",
+                        fontsize=14,
+                        align=0,
+                        overlay=True,
+                    )
+                    doc.save(single_path)
+                finally:
+                    doc.close()
+                probe = pymupdf.open(single_path)
+                try:
+                    single_printed = probe[0].get_text().splitlines()[0]
+                finally:
+                    probe.close()
+                config = {
+                    "source": str(single_path),
+                    "source_sha256": sha256_of(single_path),
+                    "page_index": 0,
+                    "printed_page": single_printed,
+                    "output": str(tmpdir_path / "out-fontfile.pdf"),
+                    "fonts_dir": str(fonts_dir),
+                    "replacements": [
+                        {
+                            "source": "SOURCE_HELLO",
+                            "text": "BONJOUR",
+                            "count": 1,
+                            "box": [50, 200, 350, 240],
+                            "fontfile": PUBLIC_FONT_FILE,
+                            "size": 14,
+                            "align": "left",
+                            "color": "#231f20",
+                        }
+                    ],
+                    "required_text": ["BONJOUR"],
+                    "protected_spans": [],
+                }
+                config_path = tmpdir_path / "config-fontfile.json"
+                config_path.write_text(
+                    json.dumps(config, ensure_ascii=False), encoding="utf-8"
+                )
+                result = edit_pdf.run(config_path)
+                self.assertEqual(result.get("status"), "complete")
+            with self.subTest(case="null-deletion"):
+                config = {
+                    "source": str(source_path),
+                    "source_sha256": sha256_of(source_path),
+                    "page_index": 0,
+                    "printed_page": printed,
+                    "output": str(tmpdir_path / "out-null.pdf"),
+                    "fonts_dir": str(fonts_dir),
+                    "replacements": [
+                        {"source": "DUP", "count": 2, "text": None, "boxes": boxes}
+                    ],
+                    "required_text": [],
+                    "protected_spans": [],
+                }
+                config_path = tmpdir_path / "config-null.json"
+                config_path.write_text(
+                    json.dumps(config, ensure_ascii=False), encoding="utf-8"
+                )
+                result = edit_pdf.run(config_path)
+                self.assertEqual(result.get("status"), "complete")
+
+
 if __name__ == "__main__":
     unittest.main()
