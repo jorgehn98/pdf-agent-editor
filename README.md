@@ -11,6 +11,8 @@ The program applies only the configured edits and its validators check the
 result. Translation was the initial use case, but the editor is generic and
 can be used for other controlled text edits.
 
+The canonical operating procedure for agents is in [`AGENTS.md`](AGENTS.md).
+
 ## Requirements and setup
 
 - Python 3
