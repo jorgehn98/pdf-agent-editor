@@ -101,7 +101,7 @@ def parse_pdffonts(output):
     return entries
 
 
-def verify_new_fonts(output_document, output_path, expected_stems, require_external=False):
+def verify_new_fonts(output_document, output_path, expected_stems, require_external=False, external_timeout=60):
     """Verify expected CID TrueType/Identity-H fonts and external metadata when available."""
     fonts = output_document.get_page_fonts(0)
     by_ref = {}
@@ -128,7 +128,7 @@ def verify_new_fonts(output_document, output_path, expected_stems, require_exter
                 "External validator failed.",
             )
         return
-    pdffonts_output = command_output(["pdffonts", str(output_path)])
+    pdffonts_output = command_output(["pdffonts", str(output_path)], timeout=external_timeout)
     by_object = {int(row["obj"]): row for row in parse_pdffonts(pdffonts_output)}
     for stem in sorted(expected_stems):
         candidates = [
@@ -446,6 +446,13 @@ def unchanged_span_key(span):
 
 def replacement_font_ref(item):
     """Return the configured font reference (``fontfile`` wins over ``font``)."""
+    for key in ("font", "fontfile"):
+        if key in item and (not isinstance(item[key], str) or not item[key]):
+            raise EditorError(
+                "CONFIG_INVALID",
+                f"Config error: replacement {key!r} must be a non-empty string",
+                "Invalid configuration.",
+            )
     reference = item.get("fontfile") or item.get("font")
     if not reference:
         raise EditorError(
@@ -634,7 +641,7 @@ def validate(config, source_document, source_page, output_path, masks):
             if entry.get("text")
         }
         if expected_stems:
-            verify_new_fonts(output_document, output_path, expected_stems, require_external)
+            verify_new_fonts(output_document, output_path, expected_stems, require_external, external_timeout)
         run_external(["pdfimages", "-list", str(output_path)], require_external, timeout=external_timeout)
         run_external(["pdfinfo", str(output_path)], require_external, timeout=external_timeout)
         run_external(["pdftotext", "-layout", str(output_path), "-"], require_external, timeout=external_timeout)
@@ -711,6 +718,20 @@ def _validate_replacement(item, index):
             f"Config error: {label} must be an object, found {item!r}",
             "Invalid configuration.",
         )
+    for key in item:
+        if key not in {"source", "count", "text", "box", "boxes", "font",
+                       "fontfile", "size", "align", "color", "lineheight"}:
+            raise EditorError(
+                "CONFIG_INVALID",
+                f"Config error: {label} has unknown key {key!r}",
+                "Invalid configuration.",
+            )
+    if "text" not in item:
+        raise EditorError(
+            "CONFIG_INVALID",
+            f"Config error: {label}.text must be an explicit string or null",
+            "Invalid configuration.",
+        )
     if not isinstance(item.get("source"), str) or not item["source"]:
         raise EditorError(
             "CONFIG_INVALID",
@@ -770,7 +791,7 @@ def _validate_replacement(item, index):
                 "Invalid configuration.",
             )
         align = item.get("align", "left")
-        if align not in _ALIGNMENTS:
+        if not isinstance(align, str) or align not in _ALIGNMENTS:
             raise EditorError(
                 "CONFIG_INVALID",
                 f"Config error: {label}.align must be one of {sorted(_ALIGNMENTS)}",
@@ -800,6 +821,16 @@ def _validate_config(config):
             "Config error: the config root must be a JSON object",
             "Invalid configuration.",
         )
+    for key in config:
+        if key not in {"source", "source_sha256", "page_index", "output",
+                       "fonts_dir", "replacements", "required_text",
+                       "protected_spans", "printed_page", "overwrite",
+                       "validation"}:
+            raise EditorError(
+                "CONFIG_INVALID",
+                f"Config error: unknown top-level key {key!r}",
+                "Invalid configuration.",
+            )
     for key in ("source", "source_sha256", "page_index", "output", "fonts_dir",
                 "replacements", "required_text", "protected_spans"):
         if key not in config:
@@ -942,6 +973,19 @@ def _resolve_workspace_path(raw, workspace):
     return workspace / candidate
 
 
+def _reject_duplicate_keys(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise EditorError(
+                "CONFIG_INVALID",
+                f"Config error: duplicate key {key!r}",
+                "Invalid configuration.",
+            )
+        result[key] = value
+    return result
+
+
 def run(config_path):
     started = time.monotonic()
     config_path = Path(config_path).expanduser()
@@ -957,7 +1001,15 @@ def run(config_path):
         )
     workspace = config_path.parent.resolve()
     try:
-        config = json.loads(config_path.read_text(encoding="utf-8"))
+        raw_text = config_path.read_text(encoding="utf-8")
+    except OSError as error:
+        raise EditorError(
+            "CONFIG_NOT_FOUND",
+            f"Config file not readable: {config_path}: {error}",
+            "Config file not found.",
+        )
+    try:
+        config = json.loads(raw_text, object_pairs_hook=_reject_duplicate_keys)
     except json.JSONDecodeError as error:
         raise EditorError(
             "CONFIG_INVALID",
@@ -1022,8 +1074,15 @@ def run(config_path):
             f"Source file not found: {source_path}",
             "Source file not found.",
         )
-    with source_path.open("rb") as handle:
-        source_hash = hashlib.file_digest(handle, "sha256").hexdigest()
+    try:
+        source_bytes = source_path.read_bytes()
+    except OSError as error:
+        raise EditorError(
+            "SOURCE_NOT_FOUND",
+            f"Source file not found: {source_path}: {error}",
+            "Source file not found.",
+        )
+    source_hash = hashlib.sha256(source_bytes).hexdigest()
     if source_hash != config["source_sha256"].lower():
         raise EditorError(
             "SOURCE_HASH_MISMATCH",
@@ -1033,7 +1092,18 @@ def run(config_path):
     # NOTE: standard PyMuPDF text metrics are used deliberately and no global
     # TOOLS flag is toggled here. Probing a box and inserting into it must see
     # identical metrics however many edits already ran in this process.
-    source = pymupdf.open(source_path)
+    # Exact validated bytes are processed: both documents open from the same
+    # in-memory snapshot so a source swap after the hash check cannot slip in.
+    try:
+        source = pymupdf.open(stream=bytes(source_bytes), filetype="pdf")
+    except EditorError:
+        raise
+    except Exception as error:
+        raise EditorError(
+            "SOURCE_INVALID",
+            f"Could not open source document: {error}",
+            "Processing failed.",
+        )
     document = None
     temporary = None
     try:
@@ -1054,7 +1124,16 @@ def run(config_path):
                     "Configured source page is not the expected printed page",
                     "Validation failed.",
                 )
-        document = pymupdf.open(source_path)
+        try:
+            document = pymupdf.open(stream=bytes(source_bytes), filetype="pdf")
+        except EditorError:
+            raise
+        except Exception as error:
+            raise EditorError(
+                "SOURCE_INVALID",
+                f"Could not open source document: {error}",
+                "Processing failed.",
+            )
         document.select([config["page_index"]])
         page = document[0]
         original_spans = spans(page)
@@ -1065,6 +1144,14 @@ def run(config_path):
                 raise EditorError(
                     "VALIDATION_FAILED",
                     f"Expected {item['count']} spans for {item['source']!r}, found {len(matches)}",
+                    "Validation failed.",
+                )
+            unique_source_boxes = {tuple(round(value, 4) for value in span["bbox"]) for span in matches}
+            if len(unique_source_boxes) != len(matches):
+                raise EditorError(
+                    "VALIDATION_FAILED",
+                    f"Ambiguous duplicate source spans for {item['source']!r}: "
+                    f"{len(matches)} spans share {len(unique_source_boxes)} unique boxes",
                     "Validation failed.",
                 )
             if "box" in item or "boxes" in item:
@@ -1133,22 +1220,101 @@ def run(config_path):
                         f"Edited text does not fit {item['text']!r}: {result:.2f}",
                         "Validation failed.",
                     )
-        output_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as error:
+            raise EditorError(
+                "OUTPUT_INVALID",
+                f"Could not create output directory: {error}",
+                "Invalid output path.",
+            )
         with tempfile.NamedTemporaryFile(dir=output_path.parent, prefix=".pdf-edit-", suffix=".pdf", delete=False) as handle:
             temporary = Path(handle.name)
-        document.save(temporary, garbage=4, deflate=True)
+        try:
+            document.save(temporary, garbage=4, deflate=True)
+        except EditorError:
+            raise
+        except Exception as error:
+            raise EditorError(
+                "SAVE_FAILED",
+                f"Could not save output: {error}",
+                "Processing failed.",
+            )
         try:
             document.close()
+        except EditorError:
+            raise
+        except Exception as error:
+            raise EditorError(
+                "CLOSE_FAILED",
+                f"Could not close document: {error}",
+                "Processing failed.",
+            )
         finally:
             document = None
         validation = validate(config, source, source_page, temporary, masks)
         try:
             source.close()
-        except Exception:
-            pass
+        except EditorError:
+            raise
+        except Exception as error:
+            raise EditorError(
+                "CLOSE_FAILED",
+                f"Could not close source: {error}",
+                "Processing failed.",
+            )
         source = None
-        os.replace(temporary, output_path)
-        temporary = None
+        overwrite = bool(config.get("overwrite", False))
+        if not overwrite:
+            try:
+                fd = os.open(output_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                raise EditorError(
+                    "OUTPUT_INVALID",
+                    "Output already exists without explicit overwrite opt-in",
+                    "Invalid output path.",
+                )
+            except OSError as error:
+                raise EditorError(
+                    "PUBLISH_FAILED",
+                    f"Could not publish output: {error}",
+                    "Processing failed.",
+                )
+            try:
+                os.close(fd)
+            except OSError as error:
+                try:
+                    output_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                raise EditorError(
+                    "PUBLISH_FAILED",
+                    f"Could not publish output: {error}",
+                    "Processing failed.",
+                )
+            try:
+                os.replace(temporary, output_path)
+            except OSError as error:
+                try:
+                    output_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                raise EditorError(
+                    "PUBLISH_FAILED",
+                    f"Could not publish output: {error}",
+                    "Processing failed.",
+                )
+            temporary = None
+        else:
+            try:
+                os.replace(temporary, output_path)
+            except OSError as error:
+                raise EditorError(
+                    "PUBLISH_FAILED",
+                    f"Could not publish output: {error}",
+                    "Processing failed.",
+                )
+            temporary = None
         try:
             relative_output = output_path.relative_to(workspace).as_posix()
         except ValueError:

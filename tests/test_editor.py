@@ -1461,5 +1461,256 @@ class TestValidMultiboxFontfile(unittest.TestCase):
                 self.assertEqual(result.get("status"), "complete")
 
 
+class TestClosedSchemaRed(unittest.TestCase):
+    """T12 RED: closed schema must reject ambiguous/unknown/duplicate/type gaps."""
+
+    def _minimal_config(self):
+        return {
+            "source": "source.pdf",
+            "source_sha256": "0" * 64,
+            "page_index": 0,
+            "output": "output.pdf",
+            "fonts_dir": "fonts",
+            "replacements": [],
+            "required_text": [],
+            "protected_spans": [],
+        }
+
+    def test_missing_text_key_rejected(self):
+        """A replacement without explicit 'text' must be CONFIG_INVALID."""
+        with self.assertRaises(edit_pdf.EditorError) as ctx:
+            edit_pdf._validate_replacement({"source": "A", "count": 1}, 0)
+        self.assertEqual(ctx.exception.code, "CONFIG_INVALID")
+
+    def test_unknown_top_level_and_replacement_keys_rejected(self):
+        with self.subTest(case="unknown-top-level"):
+            bad = dict(self._minimal_config(), extra_top_level=1)
+            with self.assertRaises(edit_pdf.EditorError) as ctx:
+                edit_pdf._validate_config(bad)
+            self.assertEqual(ctx.exception.code, "CONFIG_INVALID")
+        with self.subTest(case="unknown-replacement-key"):
+            with self.assertRaises(edit_pdf.EditorError) as ctx:
+                edit_pdf._validate_replacement(
+                    {"source": "A", "count": 1, "text": None, "bogus_key": 1}, 0
+                )
+            self.assertEqual(ctx.exception.code, "CONFIG_INVALID")
+
+    def test_duplicate_json_members_rejected_raw(self):
+        """Raw duplicate members must be rejected even when values agree."""
+        with tempfile.TemporaryDirectory(prefix="public-editor-") as tmpdir:
+            config_path, _ = _write_full_run_fixtures(tmpdir)
+            raw = Path(config_path).read_text(encoding="utf-8")
+            dup = raw.replace('"page_index": 0', '"page_index": 0, "page_index": 0', 1)
+            self.assertIn('"page_index": 0, "page_index": 0', dup)
+            Path(config_path).write_text(dup, encoding="utf-8")
+            with self.assertRaises(edit_pdf.EditorError) as ctx:
+                edit_pdf.run(config_path)
+            self.assertEqual(ctx.exception.code, "CONFIG_INVALID")
+            self.assertIn("duplicate", str(ctx.exception).lower())
+
+    def test_font_fontfile_align_scalar_types_rejected(self):
+        box = [0, 0, 10, 10]
+        cases = [
+            ("font-int", {"source": "A", "count": 1, "text": "X", "box": box,
+                          "font": 123, "size": 10, "align": "left",
+                          "color": "#231f20"}),
+            ("fontfile-int", {"source": "A", "count": 1, "text": "X", "box": box,
+                              "fontfile": 123, "size": 10, "align": "left",
+                              "color": "#231f20"}),
+            ("align-list", {"source": "A", "count": 1, "text": "X", "box": box,
+                            "font": PUBLIC_FONT_FILE, "size": 10,
+                            "align": ["left"], "color": "#231f20"}),
+        ]
+        for name, item in cases:
+            with self.subTest(case=name):
+                with self.assertRaises(edit_pdf.EditorError) as ctx:
+                    edit_pdf._validate_replacement(item, 0)
+                self.assertEqual(ctx.exception.code, "CONFIG_INVALID")
+
+    def test_same_bbox_duplicate_source_ambiguity_rejected(self):
+        """Two spans sharing one bbox must not collapse to one insertion."""
+        with tempfile.TemporaryDirectory(prefix="public-editor-") as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            source_path = tmpdir_path / "source.pdf"
+            doc = pymupdf.open()
+            try:
+                page = doc.new_page(width=400, height=600)
+                for _ in range(2):
+                    page.insert_textbox(
+                        pymupdf.Rect(50, 100, 350, 130), "DUP",
+                        fontname="helv", fontsize=12, align=0, overlay=True,
+                    )
+                doc.save(source_path)
+            finally:
+                doc.close()
+            probe = pymupdf.open(source_path)
+            try:
+                matches = [s for s in edit_pdf.spans(probe[0]) if s["text"] == "DUP"]
+                self.assertEqual(len(matches), 2)
+                uniq = {tuple(round(v, 4) for v in s["bbox"]) for s in matches}
+                self.assertEqual(len(uniq), 1)
+                single_box = [float(v) for v in matches[0]["bbox"]]
+                printed = probe[0].get_text().splitlines()[0]
+            finally:
+                probe.close()
+            fonts_dir = tmpdir_path / "fonts"
+            fonts_dir.mkdir()
+            config = {
+                "source": str(source_path),
+                "source_sha256": sha256_of(source_path),
+                "page_index": 0,
+                "printed_page": printed,
+                "output": str(tmpdir_path / "output.pdf"),
+                "fonts_dir": str(fonts_dir),
+                "replacements": [
+                    {"source": "DUP", "count": 2, "text": None, "boxes": [single_box]}
+                ],
+                "required_text": [],
+                "protected_spans": [],
+            }
+            config_path = tmpdir_path / "config.json"
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            with self.assertRaises(edit_pdf.EditorError):
+                edit_pdf.run(config_path)
+            self.assertFalse((tmpdir_path / "output.pdf").exists())
+
+
+class TestPublicationBoundaryRed(unittest.TestCase):
+    """T12 RED: publication must be fail-closed and race-safe."""
+
+    def test_source_close_failure_blocks_publication(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory(prefix="public-editor-") as tmpdir:
+            config_path, _ = _write_full_run_fixtures(tmpdir)
+            output_path = Path(
+                json.loads(Path(config_path).read_text(encoding="utf-8"))["output"]
+            )
+            original_open = pymupdf.open
+            calls = []
+
+            def _open(*args, **kwargs):
+                doc = original_open(*args, **kwargs)
+                calls.append(doc)
+                if len(calls) == 1:
+                    def _bad_close(*a, **k):
+                        raise OSError("simulated source close failure")
+                    doc.close = _bad_close
+                return doc
+
+            with mock.patch.object(pymupdf, "open", side_effect=_open):
+                with self.assertRaises(edit_pdf.EditorError):
+                    edit_pdf.run(config_path)
+            self.assertFalse(output_path.exists())
+            self.assertEqual(list(Path(tmpdir).glob(".pdf-edit-*.pdf")), [])
+
+    def test_no_clobber_atomic_when_overwrite_false(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory(prefix="public-editor-") as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            config_path, _ = _write_full_run_fixtures(str(tmpdir_path))
+            output_path = Path(
+                json.loads(Path(config_path).read_text(encoding="utf-8"))["output"]
+            )
+            self.assertFalse(output_path.exists())
+            original_validate = edit_pdf.validate
+
+            def _concurrent(*args, **kwargs):
+                output_path.write_bytes(b"CONCURRENT-WRITER")
+                return original_validate(*args, **kwargs)
+
+            with mock.patch.object(edit_pdf, "validate", side_effect=_concurrent):
+                with self.assertRaises(edit_pdf.EditorError) as ctx:
+                    edit_pdf.run(config_path)
+                self.assertEqual(ctx.exception.code, "OUTPUT_INVALID")
+            self.assertEqual(output_path.read_bytes(), b"CONCURRENT-WRITER")
+            self.assertEqual(list(tmpdir_path.glob(".pdf-edit-*.pdf")), [])
+
+    def test_post_save_preservation_reaches_validate_with_overwrite_true(self):
+        """Control: overwrite:true reaches post-save validation and preserves."""
+        with tempfile.TemporaryDirectory(prefix="public-editor-") as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            config_path, _ = _write_full_run_fixtures(str(tmpdir_path))
+            config = json.loads(Path(config_path).read_text(encoding="utf-8"))
+            output_path = Path(config["output"])
+            sentinel = b"OLD-KNOWN-GOOD-SENTINEL"
+            output_path.write_bytes(sentinel)
+            before = output_path.read_bytes()
+            config["overwrite"] = True
+            config["required_text"] = ["MISSING_SENTINEL_XYZ"]
+            Path(config_path).write_text(json.dumps(config), encoding="utf-8")
+            with self.assertRaises(edit_pdf.EditorError) as ctx:
+                edit_pdf.run(config_path)
+            self.assertEqual(ctx.exception.code, "VALIDATION_FAILED")
+            self.assertEqual(output_path.read_bytes(), before)
+            self.assertEqual(list(tmpdir_path.glob(".pdf-edit-*.pdf")), [])
+
+    def test_pdffonts_receives_external_timeout(self):
+        with tempfile.TemporaryDirectory(prefix="public-editor-") as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            config_path, _ = _write_full_run_fixtures(str(tmpdir_path))
+            config = json.loads(Path(config_path).read_text(encoding="utf-8"))
+            config["validation"] = {"external_timeout": 1}
+            Path(config_path).write_text(json.dumps(config), encoding="utf-8")
+            fakebin = tmpdir_path / "fakebin"
+            fakebin.mkdir()
+            (fakebin / "pdffonts").write_text("#!/bin/sh\nsleep 3\n", encoding="utf-8")
+            os.chmod(fakebin / "pdffonts", 0o755)
+            previous = os.environ.get("PATH", "")
+            os.environ["PATH"] = str(fakebin) + os.pathsep + previous
+            try:
+                with self.assertRaises(edit_pdf.EditorError) as ctx:
+                    edit_pdf.run(config_path)
+            finally:
+                os.environ["PATH"] = previous
+            self.assertEqual(ctx.exception.code, "VALIDATOR_FAILED")
+            self.assertIn("timed out", str(ctx.exception).lower())
+
+    def test_operational_errors_typed_stable_codes(self):
+        from unittest import mock
+        with self.subTest(case="corrupt-source-FileDataError"):
+            with tempfile.TemporaryDirectory(prefix="public-editor-") as tmpdir:
+                tmpdir_path = Path(tmpdir)
+                source_path = tmpdir_path / "source.pdf"
+                source_path.write_bytes(b"not a pdf")
+                fonts_dir = tmpdir_path / "fonts"
+                fonts_dir.mkdir()
+                config = {
+                    "source": str(source_path),
+                    "source_sha256": sha256_of(source_path),
+                    "page_index": 0,
+                    "output": str(tmpdir_path / "out.pdf"),
+                    "fonts_dir": str(fonts_dir),
+                    "replacements": [],
+                    "required_text": [],
+                    "protected_spans": [],
+                }
+                config_path = tmpdir_path / "config.json"
+                config_path.write_text(json.dumps(config), encoding="utf-8")
+                with self.assertRaises(edit_pdf.EditorError) as ctx:
+                    edit_pdf.run(config_path)
+                self.assertRegex(ctx.exception.code, r"^[A-Z][A-Z0-9_]+$")
+                self.assertNotEqual(ctx.exception.code, "INTERNAL_ERROR")
+        with self.subTest(case="save-OSError"):
+            with tempfile.TemporaryDirectory(prefix="public-editor-") as tmpdir:
+                config_path, _ = _write_full_run_fixtures(tmpdir)
+                with mock.patch.object(
+                    pymupdf.Document, "save", side_effect=OSError("sim save")
+                ):
+                    with self.assertRaises(edit_pdf.EditorError) as ctx:
+                        edit_pdf.run(config_path)
+                self.assertRegex(ctx.exception.code, r"^[A-Z][A-Z0-9_]+$")
+                self.assertNotEqual(ctx.exception.code, "INTERNAL_ERROR")
+        with self.subTest(case="publish-OSError"):
+            with tempfile.TemporaryDirectory(prefix="public-editor-") as tmpdir:
+                config_path, _ = _write_full_run_fixtures(tmpdir)
+                with mock.patch(
+                    "edit_pdf.os.replace", side_effect=OSError("sim publish")
+                ):
+                    with self.assertRaises(edit_pdf.EditorError) as ctx:
+                        edit_pdf.run(config_path)
+                self.assertRegex(ctx.exception.code, r"^[A-Z][A-Z0-9_]+$")
+                self.assertNotEqual(ctx.exception.code, "INTERNAL_ERROR")
+
+
 if __name__ == "__main__":
     unittest.main()
