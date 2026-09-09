@@ -453,6 +453,47 @@ class TestTransparencyGroupSignature(unittest.TestCase):
             edit_pdf.group_signature(collapsed_string, self._Page()),
         )
 
+    @staticmethod
+    def _write_group_pdf(path, group):
+        document = pymupdf.open()
+        try:
+            page = document.new_page(width=200, height=200)
+            group_xref = document.get_new_xref()
+            document.update_object(group_xref, group)
+            document.xref_set_key(page.xref, "Group", f"{group_xref} 0 R")
+            document.save(path)
+        finally:
+            document.close()
+
+    def test_validate_accepts_real_group_reordering_but_rejects_value_change(self):
+        """Real PDF group order is irrelevant while typed values remain protected."""
+        with tempfile.TemporaryDirectory(prefix="public-editor-") as tmpdir:
+            tmpdir = Path(tmpdir)
+            source_path = tmpdir / "source.pdf"
+            reordered_path = tmpdir / "reordered.pdf"
+            changed_path = tmpdir / "changed.pdf"
+            self._write_group_pdf(
+                source_path,
+                "<< /Type /Group /CS /DeviceCMYK /S /Transparency >>",
+            )
+            self._write_group_pdf(
+                reordered_path,
+                "<< /S /Transparency /CS /DeviceCMYK /Type /Group >>",
+            )
+            self._write_group_pdf(
+                changed_path,
+                "<< /Type /Group /CS /DeviceRGB /S /Transparency >>",
+            )
+            source = pymupdf.open(source_path)
+            try:
+                config = {"required_text": [], "protected_spans": [], "replacements": []}
+                result = edit_pdf.validate(config, source, source[0], reordered_path, [])
+                self.assertEqual(result["outside_mask_pixel_changes"], 0)
+                with self.assertRaisesRegex(edit_pdf.EditorError, "(?i)preserved object mismatch"):
+                    edit_pdf.validate(config, source, source[0], changed_path, [])
+            finally:
+                source.close()
+
 
 class TestRenderMaskAntialiasing(unittest.TestCase):
     class _Pixmap:
