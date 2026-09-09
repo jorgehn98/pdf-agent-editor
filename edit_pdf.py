@@ -786,6 +786,12 @@ def _validate_replacement(item, index):
             f"Config error: {label}.text must be a non-empty string or null",
             "Invalid configuration.",
         )
+    if text is None and "rotate" in item:
+        raise EditorError(
+            "CONFIG_INVALID",
+            f"Config error: {label}.rotate is only valid with replacement text",
+            "Invalid configuration.",
+        )
     if "box" in item and "boxes" in item:
         raise EditorError(
             "CONFIG_INVALID",
