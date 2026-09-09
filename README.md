@@ -37,20 +37,24 @@ The CLI requires one explicit config path:
 ```
 
 The config is JSON. `source`, `output`, and `fonts_dir` resolve relative to
-the config directory and must remain inside that workspace. A replacement
-identifies an exact `source` span and a `count`; text replacements also
-specify a `box` or `boxes`, font, size, alignment, and a color. `text: null`
-is the only deletion form; `text: ""` is invalid. `box` and `boxes` cannot be
+the config directory and must remain inside that workspace, including referenced
+font files. A replacement
+identifies an exact `source` span and a `count`; every replacement must include
+`text`. `text: null` is the only deletion form; `text: ""` is invalid. Text
+replacements also specify a `box` or `boxes`, string `font` or `fontfile`,
+positive size, string alignment, and a color. `box` and `boxes` cannot be
 combined, boxes must be finite and non-degenerate, replacement sources must be
-unique, and destination boxes must not overlap. Unknown `validation` keys are
-rejected. `validation.external_timeout` defaults to 60 seconds.
+unique, same-bbox duplicate source spans are rejected, and destination boxes
+must not overlap. Duplicate JSON keys and unknown root, replacement, or
+`validation` keys are rejected. `validation.external_timeout` defaults to 60
+seconds for every external validator.
 
 Existing output is preserved by default. Set the top-level `overwrite: true`
 only when replacing it intentionally (the synthetic generator does this so it
 can be rerun). Colors may be a one-, three-, or four-component list (Gray,
 RGB, or CMYK), with every component in `[0, 1]`, or a neutral gray hex value.
 Neutral gray hex values are converted to K-only CMYK. The source SHA-256 is
-checked before editing.
+checked before editing, and those exact validated bytes are processed.
 
 The process prints JSON with `status: "complete"` after validation. A failed
 CLI invocation prints JSON with `status: "partial"`, a typed safe `code`, and
