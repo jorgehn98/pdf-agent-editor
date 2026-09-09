@@ -5,6 +5,7 @@ input/
 output/
 configs/
 fonts/
+private/
 __pycache__/
 *.py[cod]
 *.pdf
