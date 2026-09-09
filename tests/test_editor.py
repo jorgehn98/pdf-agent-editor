@@ -583,6 +583,37 @@ class TestSyntheticTempRun(unittest.TestCase):
             finally:
                 probe.close()
 
+    def test_rotated_replacement_preserves_each_supported_direction(self):
+        """Every supported rotation is observable in the published PDF."""
+        expected_directions = {
+            90: (0.0, -1.0),
+            180: (-1.0, 0.0),
+            270: (0.0, 1.0),
+        }
+        for rotate, expected_direction in expected_directions.items():
+            with self.subTest(rotate=rotate):
+                with tempfile.TemporaryDirectory(prefix="public-editor-") as tmpdir:
+                    config_path, output_path = _write_full_run_fixtures(tmpdir)
+                    config = json.loads(config_path.read_text(encoding="utf-8"))
+                    config["replacements"][0]["rotate"] = rotate
+                    config["replacements"][0]["box"] = [40, 180, 360, 360]
+                    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+                    result = edit_pdf.run(config_path)
+
+                    self.assertEqual(result.get("status"), "complete")
+                    probe = pymupdf.open(output_path)
+                    try:
+                        line = next(
+                            line
+                            for block in probe[0].get_text("dict")["blocks"]
+                            for line in block.get("lines", [])
+                            if any(span["text"] == "BONJOUR" for span in line["spans"])
+                        )
+                        self.assertEqual(tuple(line["dir"]), expected_direction)
+                    finally:
+                        probe.close()
+
 
 class TestRelativeSourceResolution(unittest.TestCase):
     def test_relative_source_resolves_against_config_dir(self):
@@ -939,10 +970,20 @@ class TestStrictSchema(unittest.TestCase):
                 edit_pdf._validate_replacement(bad, 0)
         with self.subTest(case="null-deletion-allowed"):
             edit_pdf._validate_replacement({"source": "A", "count": 1, "text": None}, 0)
+        with self.subTest(case="rotate-rejected-for-null-deletion"):
+            with self.assertRaises(edit_pdf.EditorError) as ctx:
+                edit_pdf._validate_replacement(
+                    {"source": "A", "count": 1, "text": None, "rotate": 90}, 0
+                )
+            self.assertEqual(ctx.exception.code, "CONFIG_INVALID")
         with self.subTest(case="box-and-boxes-rejected"):
             bad = dict(base_item, boxes=[valid_box])
             with self.assertRaises(Exception):
                 edit_pdf._validate_replacement(bad, 0)
+        for rotate in (True, -90, 45, 360, "90"):
+            with self.subTest(case=f"invalid-rotate-{rotate!r}"):
+                with self.assertRaises(Exception):
+                    edit_pdf._validate_replacement(dict(base_item, rotate=rotate), 0)
         with self.subTest(case="unknown-validation-key-rejected"):
             config = self._base_config(
                 None, validation={"unknown_policy_key": True}

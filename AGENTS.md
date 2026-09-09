@@ -54,7 +54,8 @@ always required. Replacement source strings must be unique; duplicate source
 spans that share a bounding box are rejected as ambiguous. A text replacement
 also needs one `box` or a non-empty `boxes` list, a string font reference
 (`font` plus `fonts_dir`, or string `fontfile`), positive `size`, optional
-string `align` (`left`, `center`, or `right`), and a color. A color may be a
+string `align` (`left`, `center`, or `right`), optional `rotate` (`0`, `90`,
+`180`, or `270`; default `0`), and a color. A color may be a
 one-, three-, or
 four-component list (Gray, RGB, or CMYK), with every component in `[0, 1]`,
 or a neutral gray hex value, which is converted to K-only CMYK. Multiline text
