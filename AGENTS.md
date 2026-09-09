@@ -25,6 +25,23 @@ program.
 5. Inspect the JSON result and the rendered output. A successful run has
    `status: "complete"`; anything else is not a releaseable result.
 
+## Publication and trust boundary
+
+With the default `overwrite: false`, publication is atomic and no-clobber:
+an existing destination is never replaced. With explicit `overwrite: true`,
+publication uses an atomic replace. Resources are closed before publication;
+cleanup failures are preserved as typed `CLOSE_FAILED` errors when there is no
+earlier failure, and are chained onto the primary failure rather than hiding
+it when cleanup runs during error handling. Failure to create the temporary
+staging file is reported as `SAVE_FAILED`.
+
+The config workspace and its contents must remain under the caller's exclusive
+control for the whole execution. Resolved-path confinement protects against
+accidental path escapes, but is not intended to defend against a malicious
+concurrent process that swaps directories or symlinks. This boundary does not
+weaken the normal no-clobber, atomic-replace, validation, or exact-source-byte
+promises when the workspace is controlled as required.
+
 ## Configuration contract
 
 The required top-level fields are `source`, `source_sha256`, `page_index`,

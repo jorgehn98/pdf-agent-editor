@@ -49,9 +49,10 @@ must not overlap. Duplicate JSON keys and unknown root, replacement, or
 `validation` keys are rejected. `validation.external_timeout` defaults to 60
 seconds for every external validator.
 
-Existing output is preserved by default. Set the top-level `overwrite: true`
-only when replacing it intentionally (the synthetic generator does this so it
-can be rerun). Colors may be a one-, three-, or four-component list (Gray,
+Existing output is preserved by default through an atomic no-clobber publish.
+Set the top-level `overwrite: true` only when replacing it intentionally; that
+path uses an atomic replace (the synthetic generator opts in so it can be
+rerun). Colors may be a one-, three-, or four-component list (Gray,
 RGB, or CMYK), with every component in `[0, 1]`, or a neutral gray hex value.
 Neutral gray hex values are converted to K-only CMYK. The source SHA-256 is
 checked before editing, and those exact validated bytes are processed.
@@ -60,6 +61,11 @@ The process prints JSON with `status: "complete"` after validation. A failed
 CLI invocation prints JSON with `status: "partial"`, a typed safe `code`, and
 no sensitive exception text; `--debug` is an explicit opt-in for local detail.
 Failures do not publish an unvalidated output.
+
+The config workspace must remain under the caller's exclusive control during
+execution. Resolved-path confinement prevents accidental escapes; it is not a
+defense against another process maliciously swapping directories or symlinks
+concurrently.
 
 ## Synthetic example
 
