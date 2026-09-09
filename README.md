@@ -86,7 +86,11 @@ the example-specific flow and bundled font notice.
 Validation checks the page count and geometry, required and replaced text,
 protected and otherwise unedited spans, configured font/size/color, embedded
 fonts, preserved images/drawings/transparency metadata, external validators
-when requested, and rendered pixels outside edit masks. Set
+when requested, and rendered pixels outside edit masks. The rendered-pixel
+check allows only connected antialiasing changes within a 1.25 pt halo around
+each mask; disconnected or more distant changes still fail. Top-level
+transparency-group dictionary keys are compared by typed value, not
+serialization order. Set
 `validation.reject_rgb: true` as an opt-in policy for print jobs that must
 prohibit RGB operators in the output.
 

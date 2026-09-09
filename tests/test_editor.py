@@ -388,6 +388,153 @@ class TestGenericPageGeometry(unittest.TestCase):
             tmp.unlink(missing_ok=True)
 
 
+class TestTransparencyGroupSignature(unittest.TestCase):
+    class _Page:
+        xref = 1
+
+    class _Document:
+        def __init__(self, keys):
+            self.keys = keys
+
+        def xref_object(self, xref):
+            if xref == 1:
+                return "<< /Group 2 0 R >>"
+            values = " ".join(f"/{key} {value[1]}" for key, value in self.keys)
+            return f"<< {values} >>"
+
+        def xref_get_keys(self, xref):
+            self.assert_group(xref)
+            return tuple(key for key, _ in self.keys)
+
+        def xref_get_key(self, xref, key):
+            self.assert_group(xref)
+            return dict(self.keys)[key]
+
+        @staticmethod
+        def assert_group(xref):
+            if xref != 2:
+                raise AssertionError(f"unexpected xref {xref}")
+
+    def test_equivalent_group_key_order_has_same_signature(self):
+        """PDF dictionary key order must not affect preservation checks."""
+        entries = [
+            ("Type", ("name", "/Group")),
+            ("CS", ("name", "/DeviceCMYK")),
+            ("S", ("name", "/Transparency")),
+        ]
+        original = self._Document(entries)
+        reordered = self._Document(list(reversed(entries)))
+
+        self.assertEqual(
+            edit_pdf.group_signature(original, self._Page()),
+            edit_pdf.group_signature(reordered, self._Page()),
+        )
+        changed = self._Document([
+            ("Type", ("name", "/Group")),
+            ("CS", ("name", "/DeviceRGB")),
+            ("S", ("name", "/Transparency")),
+        ])
+        self.assertNotEqual(
+            edit_pdf.group_signature(original, self._Page()),
+            edit_pdf.group_signature(changed, self._Page()),
+        )
+        self.assertTrue(edit_pdf.group_is_cmyk(original, self._Page()))
+        self.assertFalse(edit_pdf.group_is_cmyk(changed, self._Page()))
+        wrong_type = self._Document([
+            ("Type", ("name", "/Group")),
+            ("CS", ("string", "/DeviceCMYK")),
+            ("S", ("name", "/Transparency")),
+        ])
+        self.assertFalse(edit_pdf.group_is_cmyk(wrong_type, self._Page()))
+        spaced_string = self._Document(entries + [("Note", ("string", "A  B"))])
+        collapsed_string = self._Document(entries + [("Note", ("string", "A B"))])
+        self.assertNotEqual(
+            edit_pdf.group_signature(spaced_string, self._Page()),
+            edit_pdf.group_signature(collapsed_string, self._Page()),
+        )
+
+    @staticmethod
+    def _write_group_pdf(path, group):
+        document = pymupdf.open()
+        try:
+            page = document.new_page(width=200, height=200)
+            group_xref = document.get_new_xref()
+            document.update_object(group_xref, group)
+            document.xref_set_key(page.xref, "Group", f"{group_xref} 0 R")
+            document.save(path)
+        finally:
+            document.close()
+
+    def test_validate_accepts_real_group_reordering_but_rejects_value_change(self):
+        """Real PDF group order is irrelevant while typed values remain protected."""
+        with tempfile.TemporaryDirectory(prefix="public-editor-") as tmpdir:
+            tmpdir = Path(tmpdir)
+            source_path = tmpdir / "source.pdf"
+            reordered_path = tmpdir / "reordered.pdf"
+            changed_path = tmpdir / "changed.pdf"
+            self._write_group_pdf(
+                source_path,
+                "<< /Type /Group /CS /DeviceCMYK /S /Transparency >>",
+            )
+            self._write_group_pdf(
+                reordered_path,
+                "<< /S /Transparency /CS /DeviceCMYK /Type /Group >>",
+            )
+            self._write_group_pdf(
+                changed_path,
+                "<< /Type /Group /CS /DeviceRGB /S /Transparency >>",
+            )
+            source = pymupdf.open(source_path)
+            try:
+                config = {"required_text": [], "protected_spans": [], "replacements": []}
+                result = edit_pdf.validate(config, source, source[0], reordered_path, [])
+                self.assertEqual(result["outside_mask_pixel_changes"], 0)
+                with self.assertRaisesRegex(edit_pdf.EditorError, "(?i)preserved object mismatch"):
+                    edit_pdf.validate(config, source, source[0], changed_path, [])
+            finally:
+                source.close()
+
+
+class TestRenderMaskAntialiasing(unittest.TestCase):
+    class _Pixmap:
+        width = 40
+        height = 40
+        n = 3
+
+        def __init__(self, changed_pixels=()):
+            samples = bytearray(self.width * self.height * self.n)
+            for x, y in changed_pixels:
+                samples[(y * self.width + x) * self.n] = 255
+            self.samples = bytes(samples)
+
+    class _Page:
+        def __init__(self, changed_pixels=()):
+            self.pixmap = TestRenderMaskAntialiasing._Pixmap(changed_pixels)
+
+        def get_pixmap(self, matrix, alpha):
+            return self.pixmap
+
+    def test_five_pixel_antialias_halo_is_inside_edit_mask(self):
+        source = self._Page()
+        output = self._Page([(x, 12) for x in range(16, 22)])
+
+        self.assertEqual(edit_pdf.render_diff(source, output, [[2, 2, 4, 4]]), 0)
+
+    def test_change_beyond_antialias_halo_is_rejected(self):
+        source = self._Page()
+        output = self._Page([(x, 12) for x in range(16, 23)])
+
+        with self.assertRaisesRegex(edit_pdf.EditorError, "outside edit masks"):
+            edit_pdf.render_diff(source, output, [[2, 2, 4, 4]])
+
+    def test_disconnected_change_inside_halo_is_rejected(self):
+        source = self._Page()
+        output = self._Page([(16, 12), (21, 12)])
+
+        with self.assertRaisesRegex(edit_pdf.EditorError, "outside edit masks"):
+            edit_pdf.render_diff(source, output, [[2, 2, 4, 4]])
+
+
 class TestMultilinePerBox(unittest.TestCase):
     def _validate_with_texts(self, box_texts):
         config = {
