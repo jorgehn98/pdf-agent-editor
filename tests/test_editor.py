@@ -971,10 +971,11 @@ class TestStrictSchema(unittest.TestCase):
         with self.subTest(case="null-deletion-allowed"):
             edit_pdf._validate_replacement({"source": "A", "count": 1, "text": None}, 0)
         with self.subTest(case="rotate-rejected-for-null-deletion"):
-            with self.assertRaises(Exception):
+            with self.assertRaises(edit_pdf.EditorError) as ctx:
                 edit_pdf._validate_replacement(
                     {"source": "A", "count": 1, "text": None, "rotate": 90}, 0
                 )
+            self.assertEqual(ctx.exception.code, "CONFIG_INVALID")
         with self.subTest(case="box-and-boxes-rejected"):
             bad = dict(base_item, boxes=[valid_box])
             with self.assertRaises(Exception):
