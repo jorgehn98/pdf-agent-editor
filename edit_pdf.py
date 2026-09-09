@@ -241,6 +241,20 @@ def boxes(item):
     return item["boxes"] if "boxes" in item else [item["box"]]
 
 
+def _span_rect(span):
+    """Return an output span bbox as a Rect, failing closed on invalid data."""
+    try:
+        return pymupdf.Rect(span["bbox"])
+    except EditorError:
+        raise
+    except Exception as error:
+        raise EditorError(
+            "VALIDATION_FAILED",
+            f"Invalid span bbox: {error}",
+            "Validation failed.",
+        )
+
+
 def image_signature(page):
     return [(entry["digest"].hex(), tuple(round(value, 5) for value in entry["transform"]),
              entry["has-mask"]) for entry in page.get_image_info(hashes=True, xrefs=True)]
@@ -522,7 +536,7 @@ def validate(config, source_document, source_page, output_path, masks):
             matches = [
                 span for span in output_spans
                 if span["text"] in expected_lines
-                and any(box.contains(pymupdf.Rect(span["bbox"])) for box in allowed)
+                and any(box.contains(_span_rect(span)) for box in allowed)
             ]
             expected_count = len(boxes(item)) * len(expected_lines)
             if len(matches) != expected_count:
@@ -541,7 +555,7 @@ def validate(config, source_document, source_page, output_path, masks):
             for box in allowed:
                 box_counter = Counter(
                     span["text"] for span in matches
-                    if box.contains(pymupdf.Rect(span["bbox"]))
+                    if box.contains(_span_rect(span))
                 )
                 if box_counter != expected_counter:
                     raise EditorError(
@@ -586,10 +600,7 @@ def validate(config, source_document, source_page, output_path, masks):
         def _is_inserted(span):
             if span["text"] not in inserted_lines_set:
                 return False
-            try:
-                rect = pymupdf.Rect(span["bbox"])
-            except Exception:
-                return False
+            rect = _span_rect(span)
             return any(host.contains(rect) for host in insertion_rects)
 
         source_unchanged = Counter(
@@ -648,9 +659,25 @@ def validate(config, source_document, source_page, output_path, masks):
         run_external(["gs", "-q", "-o", os.devnull, "-sDEVICE=nullpage", str(output_path)], require_external, timeout=external_timeout)
         run_external(["gs", "-q", "-dBATCH", "-dNOPAUSE", "-sDEVICE=pdfwrite", "-o", os.devnull, str(output_path)], require_external, timeout=external_timeout)
         visual_changes = render_diff(source_page, page, masks)
-        return {"images": after["image_count"], "masks": after["mask_count"], "drawings": len(after["drawings"]), "outside_mask_pixel_changes": visual_changes}
-    finally:
+        result = {"images": after["image_count"], "masks": after["mask_count"], "drawings": len(after["drawings"]), "outside_mask_pixel_changes": visual_changes}
+    except BaseException as primary:
+        try:
+            output_document.close()
+        except Exception as secondary:
+            try:
+                primary.add_note(f"cleanup close failed: {secondary}")
+            except Exception:
+                pass
+        raise
+    try:
         output_document.close()
+    except Exception as secondary:
+        raise EditorError(
+            "CLOSE_FAILED",
+            f"Could not close output: {secondary}",
+            "Processing failed.",
+        ) from secondary
+    return result
 
 
 def _cli_error_info(error):
@@ -1078,9 +1105,9 @@ def run(config_path):
         source_bytes = source_path.read_bytes()
     except OSError as error:
         raise EditorError(
-            "SOURCE_NOT_FOUND",
-            f"Source file not found: {source_path}: {error}",
-            "Source file not found.",
+            "SOURCE_INVALID",
+            f"Source file not readable: {error}",
+            "Processing failed.",
         )
     source_hash = hashlib.sha256(source_bytes).hexdigest()
     if source_hash != config["source_sha256"].lower():
@@ -1228,8 +1255,17 @@ def run(config_path):
                 f"Could not create output directory: {error}",
                 "Invalid output path.",
             )
-        with tempfile.NamedTemporaryFile(dir=output_path.parent, prefix=".pdf-edit-", suffix=".pdf", delete=False) as handle:
-            temporary = Path(handle.name)
+        try:
+            with tempfile.NamedTemporaryFile(dir=output_path.parent, prefix=".pdf-edit-", suffix=".pdf", delete=False) as handle:
+                temporary = Path(handle.name)
+        except EditorError:
+            raise
+        except Exception as error:
+            raise EditorError(
+                "SAVE_FAILED",
+                f"Could not stage output: {error}",
+                "Processing failed.",
+            )
         try:
             document.save(temporary, garbage=4, deflate=True)
         except EditorError:
@@ -1266,8 +1302,11 @@ def run(config_path):
         source = None
         overwrite = bool(config.get("overwrite", False))
         if not overwrite:
+            # Single-operation no-clobber publish: link fails if the
+            # destination exists and never overwrites it. Staging lives in
+            # the same directory, so the same filesystem applies.
             try:
-                fd = os.open(output_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.link(temporary, output_path)
             except FileExistsError:
                 raise EditorError(
                     "OUTPUT_INVALID",
@@ -1281,27 +1320,11 @@ def run(config_path):
                     "Processing failed.",
                 )
             try:
-                os.close(fd)
+                temporary.unlink()
             except OSError as error:
-                try:
-                    output_path.unlink(missing_ok=True)
-                except Exception:
-                    pass
                 raise EditorError(
-                    "PUBLISH_FAILED",
-                    f"Could not publish output: {error}",
-                    "Processing failed.",
-                )
-            try:
-                os.replace(temporary, output_path)
-            except OSError as error:
-                try:
-                    output_path.unlink(missing_ok=True)
-                except Exception:
-                    pass
-                raise EditorError(
-                    "PUBLISH_FAILED",
-                    f"Could not publish output: {error}",
+                    "CLOSE_FAILED",
+                    f"Could not clean staging file: {error}",
                     "Processing failed.",
                 )
             temporary = None
@@ -1321,22 +1344,50 @@ def run(config_path):
             relative_output = output_path.name
         return {"status": "complete", "code": "COMPLETE", "output": relative_output, "duration_seconds": round(time.monotonic() - started, 3), "validation": validation}
     finally:
+        primary = sys.exception()
         if document is not None:
             try:
                 document.close()
-            except Exception:
-                pass
+            except Exception as secondary:
+                if primary is None:
+                    raise EditorError(
+                        "CLOSE_FAILED",
+                        f"Could not close document: {secondary}",
+                        "Processing failed.",
+                    )
+                try:
+                    primary.add_note(f"cleanup document close failed: {secondary}")
+                except Exception:
+                    pass
         if source is not None:
             try:
                 source.close()
-            except Exception:
-                pass
+            except Exception as secondary:
+                if primary is None:
+                    raise EditorError(
+                        "CLOSE_FAILED",
+                        f"Could not close source: {secondary}",
+                        "Processing failed.",
+                    )
+                try:
+                    primary.add_note(f"cleanup source close failed: {secondary}")
+                except Exception:
+                    pass
         if temporary is not None:
             try:
                 if temporary.exists():
                     temporary.unlink()
-            except Exception:
-                pass
+            except Exception as secondary:
+                if primary is None:
+                    raise EditorError(
+                        "CLOSE_FAILED",
+                        f"Could not clean staging file: {secondary}",
+                        "Processing failed.",
+                    )
+                try:
+                    primary.add_note(f"cleanup staging unlink failed: {secondary}")
+                except Exception:
+                    pass
 
 
 if __name__ == "__main__":

@@ -1704,12 +1704,156 @@ class TestPublicationBoundaryRed(unittest.TestCase):
             with tempfile.TemporaryDirectory(prefix="public-editor-") as tmpdir:
                 config_path, _ = _write_full_run_fixtures(tmpdir)
                 with mock.patch(
-                    "edit_pdf.os.replace", side_effect=OSError("sim publish")
+                    "edit_pdf.os.link", side_effect=OSError("sim publish")
                 ):
                     with self.assertRaises(edit_pdf.EditorError) as ctx:
                         edit_pdf.run(config_path)
-                self.assertRegex(ctx.exception.code, r"^[A-Z][A-Z0-9_]+$")
-                self.assertNotEqual(ctx.exception.code, "INTERNAL_ERROR")
+                self.assertEqual(ctx.exception.code, "PUBLISH_FAILED")
+
+
+class TestRevalidationRed(unittest.TestCase):
+    """T12 revalidation RED: race-after-reserve, temp SAVE_FAILED, bad-bbox,
+    cleanup chaining, exact operational codes. No pdffonts duplicate."""
+
+    def test_no_clobber_race_after_reservation_preserves_competitor(self):
+        """Competitor racing the single no-clobber link must not be clobbered."""
+        from unittest import mock
+        with tempfile.TemporaryDirectory(prefix="public-editor-") as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            config_path, _ = _write_full_run_fixtures(str(tmpdir_path))
+            output_path = Path(
+                json.loads(Path(config_path).read_text(encoding="utf-8"))["output"]
+            )
+            self.assertFalse(output_path.exists())
+            original_link = os.link
+
+            def _link(a, b):
+                if Path(b) == output_path:
+                    Path(b).write_bytes(b"COMPETITOR-JUST-BEFORE-COMMIT")
+                return original_link(a, b)
+
+            with mock.patch("edit_pdf.os.link", side_effect=_link):
+                with self.assertRaises(edit_pdf.EditorError) as ctx:
+                    edit_pdf.run(config_path)
+                self.assertEqual(ctx.exception.code, "OUTPUT_INVALID")
+            self.assertEqual(
+                output_path.read_bytes(), b"COMPETITOR-JUST-BEFORE-COMMIT"
+            )
+            self.assertEqual(list(tmpdir_path.glob(".pdf-edit-*.pdf")), [])
+
+    def test_temp_creation_and_close_oserror_maps_to_save_failed(self):
+        from unittest import mock
+        with self.subTest(case="create"):
+            with tempfile.TemporaryDirectory(prefix="public-editor-") as tmpdir:
+                config_path, _ = _write_full_run_fixtures(tmpdir)
+                with mock.patch(
+                    "edit_pdf.tempfile.NamedTemporaryFile",
+                    side_effect=OSError("sim tmp create"),
+                ):
+                    with self.assertRaises(edit_pdf.EditorError) as ctx:
+                        edit_pdf.run(config_path)
+                self.assertEqual(ctx.exception.code, "SAVE_FAILED")
+        with self.subTest(case="close"):
+            with tempfile.TemporaryDirectory(prefix="public-editor-") as tmpdir:
+                config_path, _ = _write_full_run_fixtures(tmpdir)
+                original_ntf = tempfile.NamedTemporaryFile
+
+                def _bad_ntf(*args, **kwargs):
+                    handle_cm = original_ntf(*args, **kwargs)
+                    handle = handle_cm.__enter__()
+
+                    class _Wrapper:
+                        def __enter__(self):
+                            return handle
+
+                        def __exit__(self, *exc):
+                            try:
+                                handle_cm.__exit__(*exc)
+                            finally:
+                                raise OSError("sim tmp close")
+
+                    return _Wrapper()
+
+                with mock.patch(
+                    "edit_pdf.tempfile.NamedTemporaryFile", side_effect=_bad_ntf
+                ):
+                    with self.assertRaises(edit_pdf.EditorError) as ctx:
+                        edit_pdf.run(config_path)
+                self.assertEqual(ctx.exception.code, "SAVE_FAILED")
+
+    def test_is_inserted_invalid_bbox_raises_validation_failed(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory(prefix="public-editor-") as tmpdir:
+            config_path, _ = _write_full_run_fixtures(tmpdir)
+            original_spans = edit_pdf.spans
+
+            def _spans(page):
+                real = list(original_spans(page))
+                if any(span.get("text") == "BONJOUR" for span in real):
+                    bad = dict(real[0])
+                    bad["text"] = "BONJOUR"
+                    bad["bbox"] = ["bad", 0, 10, 10]
+                    real.append(bad)
+                return real
+
+            with mock.patch.object(edit_pdf, "spans", side_effect=_spans):
+                with self.assertRaises(edit_pdf.EditorError) as ctx:
+                    edit_pdf.run(config_path)
+            self.assertEqual(ctx.exception.code, "VALIDATION_FAILED")
+
+    def test_cleanup_close_errors_primary_preserved_and_close_failed(self):
+        from unittest import mock
+        original_open = pymupdf.open
+
+        def _open_fail_output_close(*args, **kwargs):
+            doc = original_open(*args, **kwargs)
+            if "stream" not in kwargs and args:
+                def _bad_close(*a, **k):
+                    raise OSError("sim output close")
+                doc.close = _bad_close
+            return doc
+
+        with self.subTest(case="no-primary-close-failed"):
+            with tempfile.TemporaryDirectory(prefix="public-editor-") as tmpdir:
+                config_path, _ = _write_full_run_fixtures(tmpdir)
+                with mock.patch.object(
+                    pymupdf, "open", side_effect=_open_fail_output_close
+                ):
+                    with self.assertRaises(edit_pdf.EditorError) as ctx:
+                        edit_pdf.run(config_path)
+                self.assertEqual(ctx.exception.code, "CLOSE_FAILED")
+        with self.subTest(case="primary-preserved-secondary-annotated"):
+            with tempfile.TemporaryDirectory(prefix="public-editor-") as tmpdir:
+                config_path, _ = _write_full_run_fixtures(tmpdir)
+                config = json.loads(Path(config_path).read_text(encoding="utf-8"))
+                config["required_text"] = ["MISSING_SENTINEL_XYZ"]
+                Path(config_path).write_text(json.dumps(config), encoding="utf-8")
+                with mock.patch.object(
+                    pymupdf, "open", side_effect=_open_fail_output_close
+                ):
+                    with self.assertRaises(edit_pdf.EditorError) as ctx:
+                        edit_pdf.run(config_path)
+                self.assertEqual(ctx.exception.code, "VALIDATION_FAILED")
+                secondary = "sim output close"
+                context_str = str(getattr(ctx.exception, "__context__", "") or "")
+                notes = getattr(ctx.exception, "__notes__", None) or []
+                notes_str = " ".join(str(note) for note in notes)
+                self.assertTrue(
+                    secondary in context_str or secondary in notes_str,
+                    msg=f"secondary not annotated: context={context_str!r} "
+                    f"notes={notes_str!r}",
+                )
+
+    def test_source_read_oserror_maps_to_source_invalid(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory(prefix="public-editor-") as tmpdir:
+            config_path, _ = _write_full_run_fixtures(tmpdir)
+            with mock.patch.object(
+                Path, "read_bytes", side_effect=OSError("sim read")
+            ):
+                with self.assertRaises(edit_pdf.EditorError) as ctx:
+                    edit_pdf.run(config_path)
+            self.assertEqual(ctx.exception.code, "SOURCE_INVALID")
 
 
 if __name__ == "__main__":
