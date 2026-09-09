@@ -78,7 +78,9 @@ skipped, while failures from present tools still fail validation.
 The accepted validation keys are only `require_cmyk_group`, `reject_rgb`,
 `require_external_validators`, and `external_timeout`; unknown keys are
 rejected. `validation.external_timeout` defaults to 60 seconds and is applied
-to every external validator, including `pdffonts`.
+to every external validator, including `pdffonts`. Render comparison allows a
+1.25 pt antialiasing halo around declared edit masks, while changes beyond it
+still fail. Transparency-group dictionary order is not semantically relevant.
 
 CLI failures return typed, privacy-safe codes and messages. In particular,
 source-open, save, close, and publish failures use `SOURCE_INVALID`,

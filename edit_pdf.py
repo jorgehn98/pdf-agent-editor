@@ -301,8 +301,8 @@ def group_signature(document, page):
     """Return a normalized signature of the page transparency group.
 
     Returns ``None`` when the page references no ``/Group`` object, otherwise
-    a whitespace-normalized string of the referenced group object, so any
-    group (CMYK or not) is compared and preserved exactly.
+    a key-sorted tuple of the referenced PDF dictionary, so semantically
+    irrelevant key ordering does not cause a preservation mismatch.
 
     Inspection failures raise instead of returning ``None`` (fail-closed).
     """
@@ -310,19 +310,24 @@ def group_signature(document, page):
     match = re.search(r"/Group\s+(\d+)\s+\d+\s+R", raw)
     if not match:
         return None
-    group = document.xref_object(int(match.group(1)))
-    return re.sub(r"\s+", " ", group).strip()
+    group_xref = int(match.group(1))
+    return tuple(sorted(
+        (
+            key,
+            value_type,
+            re.sub(r"\s+", " ", value).strip(),
+        )
+        for key in document.xref_get_keys(group_xref)
+        for value_type, value in [document.xref_get_key(group_xref, key)]
+    ))
 
 
 def group_is_cmyk(document, page):
     signature = group_signature(document, page)
     if signature is None:
         return False
-    if not re.search(r"/CS\s+/DeviceCMYK", signature):
-        return False
-    if not re.search(r"/S\s+/Transparency", signature):
-        return False
-    return True
+    values = {key: value for key, _value_type, value in signature}
+    return values.get("CS") == "/DeviceCMYK" and values.get("S") == "/Transparency"
 
 
 def source_metadata(document, page):
@@ -339,6 +344,7 @@ def source_metadata(document, page):
 
 def render_diff(source_page, output_page, masks):
     scale = 4
+    antialias_padding = 5
     source = source_page.get_pixmap(matrix=pymupdf.Matrix(scale, scale), alpha=False)
     output = output_page.get_pixmap(matrix=pymupdf.Matrix(scale, scale), alpha=False)
     if (source.width, source.height, source.n) != (output.width, output.height, output.n):
@@ -350,8 +356,10 @@ def render_diff(source_page, output_page, masks):
     mask = bytearray(source.width * source.height)
     for rect in masks:
         rect = pymupdf.Rect(rect)
-        left, top = max(0, int(rect.x0 * scale)), max(0, int(rect.y0 * scale))
-        right, bottom = min(source.width, int(rect.x1 * scale) + 1), min(source.height, int(rect.y1 * scale) + 1)
+        left = max(0, int(rect.x0 * scale) - antialias_padding)
+        top = max(0, int(rect.y0 * scale) - antialias_padding)
+        right = min(source.width, int(rect.x1 * scale) + 1 + antialias_padding)
+        bottom = min(source.height, int(rect.y1 * scale) + 1 + antialias_padding)
         for y in range(top, bottom):
             mask[y * source.width + left:y * source.width + right] = b"\1" * (right - left)
     changes = 0

@@ -388,6 +388,94 @@ class TestGenericPageGeometry(unittest.TestCase):
             tmp.unlink(missing_ok=True)
 
 
+class TestTransparencyGroupSignature(unittest.TestCase):
+    class _Page:
+        xref = 1
+
+    class _Document:
+        def __init__(self, keys):
+            self.keys = keys
+
+        def xref_object(self, xref):
+            if xref == 1:
+                return "<< /Group 2 0 R >>"
+            values = " ".join(f"/{key} {value[1]}" for key, value in self.keys)
+            return f"<< {values} >>"
+
+        def xref_get_keys(self, xref):
+            self.assert_group(xref)
+            return tuple(key for key, _ in self.keys)
+
+        def xref_get_key(self, xref, key):
+            self.assert_group(xref)
+            return dict(self.keys)[key]
+
+        @staticmethod
+        def assert_group(xref):
+            if xref != 2:
+                raise AssertionError(f"unexpected xref {xref}")
+
+    def test_equivalent_group_key_order_has_same_signature(self):
+        """PDF dictionary key order must not affect preservation checks."""
+        entries = [
+            ("Type", ("name", "/Group")),
+            ("CS", ("name", "/DeviceCMYK")),
+            ("S", ("name", "/Transparency")),
+        ]
+        original = self._Document(entries)
+        reordered = self._Document(list(reversed(entries)))
+
+        self.assertEqual(
+            edit_pdf.group_signature(original, self._Page()),
+            edit_pdf.group_signature(reordered, self._Page()),
+        )
+        changed = self._Document([
+            ("Type", ("name", "/Group")),
+            ("CS", ("name", "/DeviceRGB")),
+            ("S", ("name", "/Transparency")),
+        ])
+        self.assertNotEqual(
+            edit_pdf.group_signature(original, self._Page()),
+            edit_pdf.group_signature(changed, self._Page()),
+        )
+        self.assertTrue(edit_pdf.group_is_cmyk(original, self._Page()))
+        self.assertFalse(edit_pdf.group_is_cmyk(changed, self._Page()))
+
+
+class TestRenderMaskAntialiasing(unittest.TestCase):
+    class _Pixmap:
+        width = 40
+        height = 40
+        n = 3
+
+        def __init__(self, changed_pixel=None):
+            samples = bytearray(self.width * self.height * self.n)
+            if changed_pixel is not None:
+                x, y = changed_pixel
+                samples[(y * self.width + x) * self.n] = 255
+            self.samples = bytes(samples)
+
+    class _Page:
+        def __init__(self, changed_pixel=None):
+            self.pixmap = TestRenderMaskAntialiasing._Pixmap(changed_pixel)
+
+        def get_pixmap(self, matrix, alpha):
+            return self.pixmap
+
+    def test_five_pixel_antialias_halo_is_inside_edit_mask(self):
+        source = self._Page()
+        output = self._Page((21, 12))
+
+        self.assertEqual(edit_pdf.render_diff(source, output, [[2, 2, 4, 4]]), 0)
+
+    def test_change_beyond_antialias_halo_is_rejected(self):
+        source = self._Page()
+        output = self._Page((23, 12))
+
+        with self.assertRaisesRegex(edit_pdf.EditorError, "outside edit masks"):
+            edit_pdf.render_diff(source, output, [[2, 2, 4, 4]])
+
+
 class TestMultilinePerBox(unittest.TestCase):
     def _validate_with_texts(self, box_texts):
         config = {
