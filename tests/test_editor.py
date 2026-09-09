@@ -583,6 +583,30 @@ class TestSyntheticTempRun(unittest.TestCase):
             finally:
                 probe.close()
 
+    def test_rotated_replacement_preserves_vertical_direction(self):
+        """A 90-degree replacement is published as vertical text."""
+        with tempfile.TemporaryDirectory(prefix="public-editor-") as tmpdir:
+            config_path, output_path = _write_full_run_fixtures(tmpdir)
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["replacements"][0]["rotate"] = 90
+            config["replacements"][0]["box"] = [40, 180, 100, 360]
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+
+            result = edit_pdf.run(config_path)
+
+            self.assertEqual(result.get("status"), "complete")
+            probe = pymupdf.open(output_path)
+            try:
+                line = next(
+                    line
+                    for block in probe[0].get_text("dict")["blocks"]
+                    for line in block.get("lines", [])
+                    if any(span["text"] == "BONJOUR" for span in line["spans"])
+                )
+                self.assertEqual(tuple(line["dir"]), (0.0, -1.0))
+            finally:
+                probe.close()
+
 
 class TestRelativeSourceResolution(unittest.TestCase):
     def test_relative_source_resolves_against_config_dir(self):
@@ -943,6 +967,10 @@ class TestStrictSchema(unittest.TestCase):
             bad = dict(base_item, boxes=[valid_box])
             with self.assertRaises(Exception):
                 edit_pdf._validate_replacement(bad, 0)
+        for rotate in (True, -90, 45, 360, "90"):
+            with self.subTest(case=f"invalid-rotate-{rotate!r}"):
+                with self.assertRaises(Exception):
+                    edit_pdf._validate_replacement(dict(base_item, rotate=rotate), 0)
         with self.subTest(case="unknown-validation-key-rejected"):
             config = self._base_config(
                 None, validation={"unknown_policy_key": True}

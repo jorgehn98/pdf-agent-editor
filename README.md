@@ -45,7 +45,8 @@ replacements also specify a `box` or `boxes`, string `font` or `fontfile`,
 positive size, string alignment, and a color. `box` and `boxes` cannot be
 combined, boxes must be finite and non-degenerate, replacement sources must be
 unique, same-bbox duplicate source spans are rejected, and destination boxes
-must not overlap. Duplicate JSON keys and unknown root, replacement, or
+must not overlap. Optional `rotate` accepts `0`, `90`, `180`, or `270` degrees
+and defaults to `0`. Duplicate JSON keys and unknown root, replacement, or
 `validation` keys are rejected. `validation.external_timeout` defaults to 60
 seconds for every external validator.
 

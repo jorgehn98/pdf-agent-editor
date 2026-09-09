@@ -747,7 +747,8 @@ def _validate_replacement(item, index):
         )
     for key in item:
         if key not in {"source", "count", "text", "box", "boxes", "font",
-                       "fontfile", "size", "align", "color", "lineheight"}:
+                       "fontfile", "size", "align", "color", "lineheight",
+                       "rotate"}:
             raise EditorError(
                 "CONFIG_INVALID",
                 f"Config error: {label} has unknown key {key!r}",
@@ -822,6 +823,17 @@ def _validate_replacement(item, index):
             raise EditorError(
                 "CONFIG_INVALID",
                 f"Config error: {label}.align must be one of {sorted(_ALIGNMENTS)}",
+                "Invalid configuration.",
+            )
+        rotate = item.get("rotate", 0)
+        if (
+            isinstance(rotate, bool)
+            or not isinstance(rotate, int)
+            or rotate not in {0, 90, 180, 270}
+        ):
+            raise EditorError(
+                "CONFIG_INVALID",
+                f"Config error: {label}.rotate must be one of [0, 90, 180, 270]",
                 "Invalid configuration.",
             )
         if "color" not in item:
@@ -1240,7 +1252,8 @@ def run(config_path):
                 result = page.insert_textbox(pymupdf.Rect(box), item["text"], fontname=Path(replacement_font_ref(item)).stem,
                                              fontfile=str(font_path), fontsize=item["size"],
                                              lineheight=item.get("lineheight", 1), color=resolve_color(item["color"]),
-                                             align=_ALIGNMENTS[item.get("align", "left")], overlay=True)
+                                             align=_ALIGNMENTS[item.get("align", "left")],
+                                             rotate=item.get("rotate", 0), overlay=True)
                 if result < 0:
                     raise EditorError(
                         "VALIDATION_FAILED",
