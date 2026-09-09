@@ -440,6 +440,18 @@ class TestTransparencyGroupSignature(unittest.TestCase):
         )
         self.assertTrue(edit_pdf.group_is_cmyk(original, self._Page()))
         self.assertFalse(edit_pdf.group_is_cmyk(changed, self._Page()))
+        wrong_type = self._Document([
+            ("Type", ("name", "/Group")),
+            ("CS", ("string", "/DeviceCMYK")),
+            ("S", ("name", "/Transparency")),
+        ])
+        self.assertFalse(edit_pdf.group_is_cmyk(wrong_type, self._Page()))
+        spaced_string = self._Document(entries + [("Note", ("string", "A  B"))])
+        collapsed_string = self._Document(entries + [("Note", ("string", "A B"))])
+        self.assertNotEqual(
+            edit_pdf.group_signature(spaced_string, self._Page()),
+            edit_pdf.group_signature(collapsed_string, self._Page()),
+        )
 
 
 class TestRenderMaskAntialiasing(unittest.TestCase):
@@ -448,29 +460,35 @@ class TestRenderMaskAntialiasing(unittest.TestCase):
         height = 40
         n = 3
 
-        def __init__(self, changed_pixel=None):
+        def __init__(self, changed_pixels=()):
             samples = bytearray(self.width * self.height * self.n)
-            if changed_pixel is not None:
-                x, y = changed_pixel
+            for x, y in changed_pixels:
                 samples[(y * self.width + x) * self.n] = 255
             self.samples = bytes(samples)
 
     class _Page:
-        def __init__(self, changed_pixel=None):
-            self.pixmap = TestRenderMaskAntialiasing._Pixmap(changed_pixel)
+        def __init__(self, changed_pixels=()):
+            self.pixmap = TestRenderMaskAntialiasing._Pixmap(changed_pixels)
 
         def get_pixmap(self, matrix, alpha):
             return self.pixmap
 
     def test_five_pixel_antialias_halo_is_inside_edit_mask(self):
         source = self._Page()
-        output = self._Page((21, 12))
+        output = self._Page([(x, 12) for x in range(16, 22)])
 
         self.assertEqual(edit_pdf.render_diff(source, output, [[2, 2, 4, 4]]), 0)
 
     def test_change_beyond_antialias_halo_is_rejected(self):
         source = self._Page()
-        output = self._Page((23, 12))
+        output = self._Page([(x, 12) for x in range(16, 23)])
+
+        with self.assertRaisesRegex(edit_pdf.EditorError, "outside edit masks"):
+            edit_pdf.render_diff(source, output, [[2, 2, 4, 4]])
+
+    def test_disconnected_change_inside_halo_is_rejected(self):
+        source = self._Page()
+        output = self._Page([(16, 12), (21, 12)])
 
         with self.assertRaisesRegex(edit_pdf.EditorError, "outside edit masks"):
             edit_pdf.render_diff(source, output, [[2, 2, 4, 4]])

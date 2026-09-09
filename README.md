@@ -87,9 +87,10 @@ Validation checks the page count and geometry, required and replaced text,
 protected and otherwise unedited spans, configured font/size/color, embedded
 fonts, preserved images/drawings/transparency metadata, external validators
 when requested, and rendered pixels outside edit masks. The rendered-pixel
-check includes a 1.25 pt antialiasing halo around each mask; changes beyond it
-still fail. Transparency-group dictionaries are compared by typed key/value,
-not serialization order. Set
+check allows only connected antialiasing changes within a 1.25 pt halo around
+each mask; disconnected or more distant changes still fail. Top-level
+transparency-group dictionary keys are compared by typed value, not
+serialization order. Set
 `validation.reject_rgb: true` as an opt-in policy for print jobs that must
 prohibit RGB operators in the output.
 
